@@ -7,10 +7,13 @@ edition = "2024"
 anyhow = "1.0.98"
 clap = { version = "4.5.41", features = ["derive"] }
 prost = "0.13"
+rand = "0.9.2"
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.46.1", features = ["full"] }
 toml = "0.9.2"
 tonic = "0.13.1"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
 
 [build-dependencies]
 tonic-build = { version = "0.13.1", features = ["prost"] }

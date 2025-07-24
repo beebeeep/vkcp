@@ -2,18 +2,20 @@ syntax = "proto3";
 package vkcp;
 
 service Vkcp {
-    rpc SendUpdate(SendUpdateRequest) returns (SendUpdateResponse);
+    rpc Heatbeat(HeatbeatRequest) returns (HeatbeatResponse);
     rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
 
 }
 
-message SendUpdateRequest {
+message HeatbeatRequest {
     uint64 term = 1;
     uint32 leaderID = 2;
     uint32 valkeyMasterID = 3;
 }
 
-message SendUpdateResponse {
+message HeatbeatResponse {
+    uint64 term = 1;
+    bool success = 2;
 }
 
 message RequestVoteRequest {
