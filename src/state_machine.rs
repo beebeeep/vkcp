@@ -6,6 +6,8 @@ use crate::config;
 use crate::grpc;
 use crate::grpc::vkcp_client::VkcpClient;
 use anyhow::{Context, Result};
+use fred::prelude as fredis;
+use fred::prelude::ClientLike;
 use rand::Rng;
 use rand::rng;
 use tokio::select;
@@ -21,8 +23,10 @@ use tracing::{debug, error, info, warn};
 const HEARTBEAT_PERIOD: Duration = Duration::from_millis(1500); // main leader loop timeout
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(300);
 const ELECTION_TIMEOUT_MS: Range<u64> = 2500..3000;
+const VK_SERVER_TIMEOUT: Duration = Duration::from_millis(500);
+const VK_SERVER_CHECK_PERIOD: Duration = Duration::from_millis(2000);
 
-pub enum ServerState {
+pub enum MachineState {
     Leader,
     Follower,
     Candidate,
@@ -31,6 +35,12 @@ pub enum ServerState {
 struct PeerState {
     client: VkcpClient<Channel>,
     id: u32,
+}
+
+#[derive(Debug)]
+struct ServerState {
+    is_master: bool,
+    offset: u64,
 }
 
 pub enum Message {
@@ -61,9 +71,10 @@ pub struct StateMachine {
     current_master: Arc<RwLock<String>>,
 
     // volatile state
-    state: ServerState,
+    state: MachineState,
     term: u64,
     next_follower_update: Instant,
+    next_servers_ping: Instant,
 
     // volatile state on candidate
     votes_received: u32,
@@ -85,9 +96,10 @@ impl StateMachine {
             tx_msgs,
             quorum: (peers.len() / 2 + 1) as u32,
             peers: Self::init_peers(peers)?,
-            election_timeout: Self::next_election_timeout(None), // such short timeout may cause unnecessary elections on startup (also it's bugged)
-            state: ServerState::Follower,
+            election_timeout: Self::next_election_timeout(None),
+            state: MachineState::Follower,
             next_follower_update: Instant::now(),
+            next_servers_ping: Instant::now(),
             votes_received: 0,
             servers,
             current_master,
@@ -99,9 +111,9 @@ impl StateMachine {
     pub async fn run(&mut self) {
         loop {
             let err = match self.state {
-                ServerState::Leader => self.run_leader().await,
-                ServerState::Follower => self.run_follower().await,
-                ServerState::Candidate => self.run_candidate().await,
+                MachineState::Leader => self.run_leader().await,
+                MachineState::Follower => self.run_follower().await,
+                MachineState::Candidate => self.run_candidate().await,
             };
             match err {
                 Ok(_) => {}
@@ -285,7 +297,7 @@ impl StateMachine {
 
     async fn convert_to_candidate(&mut self) -> Result<()> {
         info!("converting to candidate");
-        self.state = ServerState::Candidate;
+        self.state = MachineState::Candidate;
         self.term += 1;
         self.voted_for = Some(self.id);
         self.votes_received = 1;
@@ -309,12 +321,12 @@ impl StateMachine {
 
     fn convert_to_follower(&mut self) {
         info!("converting to follower");
-        self.state = ServerState::Follower;
+        self.state = MachineState::Follower;
     }
 
     fn convert_to_leader(&mut self) {
         info!("converting to leader");
-        self.state = ServerState::Leader;
+        self.state = MachineState::Leader;
     }
 
     async fn request_vote_from_peer(
@@ -324,10 +336,7 @@ impl StateMachine {
         term: u64,
         candidate_id: u32,
     ) {
-        let req = grpc::RequestVoteRequest {
-            term,
-            candidate_id: candidate_id as u32,
-        };
+        let req = grpc::RequestVoteRequest { term, candidate_id };
         match client.request_vote(req).await {
             Ok(repl) => {
                 let repl = repl.into_inner();
@@ -349,8 +358,25 @@ impl StateMachine {
     }
 
     async fn maybe_update_servers_health(&mut self) -> Result<()> {
-        for _server in self.servers.iter() {
-            // TODO: connect and check
+        if Instant::now() < self.next_servers_ping {
+            return Ok(());
+        }
+        self.next_servers_ping = Instant::now() + VK_SERVER_CHECK_PERIOD;
+
+        for server in self.servers.iter() {
+            match Self::get_server_state(server).await {
+                Err(e) => {
+                    error!(
+                        server = server,
+                        error = format!("{e:#}"),
+                        "getting server info"
+                    );
+                    continue;
+                }
+                Ok(state) => {
+                    debug!(server = server, state = ?state, "server state");
+                }
+            }
         }
         Ok(())
     }
@@ -414,5 +440,53 @@ impl StateMachine {
                 rng().random_range(r.unwrap_or(ELECTION_TIMEOUT_MS)),
             ))
             .unwrap()
+    }
+
+    async fn get_server_state(addr: &str) -> Result<ServerState> {
+        let mut cfg = fredis::Config::from_url(&format!("redis://{addr}")).unwrap();
+        cfg.fail_fast = true;
+        let client = fredis::Builder::from_config(cfg)
+            .with_connection_config(|cfg| {
+                cfg.connection_timeout = VK_SERVER_TIMEOUT;
+                cfg.tcp = fredis::TcpConfig {
+                    nodelay: Some(true),
+                    ..Default::default()
+                };
+            })
+            .build()
+            .unwrap();
+        client.init().await.context("connecting to server")?;
+
+        let info: fredis::FredResult<String> =
+            client.info(Some(fred::types::InfoKind::Replication)).await;
+        if let Err(e) = client.quit().await {
+            warn!(
+                server = addr,
+                error = format!("{e:#}"),
+                "closing connection"
+            );
+        }
+
+        let info = info.context("getting info")?;
+        let mut state = ServerState {
+            is_master: false,
+            offset: 0,
+        };
+
+        for line in info.split("\r\n") {
+            let mut p = line.split(":");
+            match (p.next(), p.next()) {
+                (Some("role"), Some("master")) => state.is_master = true,
+                (Some("slave_repl_offset"), Some(offset)) => {
+                    state.offset = offset.parse().unwrap_or_default();
+                }
+                (Some("master_repl_offset"), Some(offset)) => {
+                    state.offset = offset.parse().unwrap_or_default();
+                }
+                _ => {}
+            }
+        }
+
+        Ok(state)
     }
 }
