@@ -1,11 +1,11 @@
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config;
 use crate::grpc;
 use crate::grpc::vkcp_client::VkcpClient;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rand::Rng;
 use rand::rng;
 use tokio::select;
@@ -19,6 +19,7 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 const HEARTBEAT_PERIOD: Duration = Duration::from_millis(1500); // main leader loop timeout
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(300);
 const ELECTION_TIMEOUT_MS: Range<u64> = 2500..3000;
 
 pub enum ServerState {
@@ -44,6 +45,7 @@ pub enum Message {
 
     // messages from internal async jobs
     ReceiveVote(grpc::RequestVoteResponse),
+    HeartbeatResponse(grpc::HeartbeatResponse),
 }
 
 pub struct StateMachine {
@@ -61,6 +63,7 @@ pub struct StateMachine {
     // volatile state
     state: ServerState,
     term: u64,
+    next_follower_update: Instant,
 
     // volatile state on candidate
     votes_received: u32,
@@ -70,7 +73,7 @@ pub struct StateMachine {
 impl StateMachine {
     pub fn new(
         id: u32,
-        peers: Vec<String>,
+        peers: Vec<config::PeerConfig>,
         current_master: Arc<RwLock<String>>,
         servers: Vec<String>,
         rx_msgs: mpsc::Receiver<Message>,
@@ -82,8 +85,9 @@ impl StateMachine {
             tx_msgs,
             quorum: (peers.len() / 2 + 1) as u32,
             peers: Self::init_peers(peers)?,
-            election_timeout: Self::next_election_timeout(Some(100..200)), // such short timeout may cause unnecessary elections on startup (also it's bugged)
+            election_timeout: Self::next_election_timeout(None), // such short timeout may cause unnecessary elections on startup (also it's bugged)
             state: ServerState::Follower,
+            next_follower_update: Instant::now(),
             votes_received: 0,
             servers,
             current_master,
@@ -106,15 +110,11 @@ impl StateMachine {
         }
     }
 
-    async fn maybe_update_servers_health(&mut self) -> Result<()> {
-        todo!("go through all valkeys and get their status");
-    }
-
     async fn run_leader(&mut self) -> Result<()> {
         self.maybe_update_servers_health()
             .await
             .context("updating followers")?;
-        self.update_followers()
+        self.maybe_update_followers()
             .await
             .context("updating commitIndex")?;
 
@@ -127,6 +127,12 @@ impl StateMachine {
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as we are leader already
+                    },
+                    Message::HeartbeatResponse(resp) => {
+                        if resp.term > self.term {
+                            info!(term = resp.term, "got heartbeat response with greater term, converting to follower");
+                            self.convert_to_follower();
+                        }
                     },
                     Message::Heartbeat{req, resp } => {
                         if req.term > self.term {
@@ -156,6 +162,9 @@ impl StateMachine {
                     Message::ReceiveVote(_) => {
                         // don't care as follower
                     },
+                    Message::HeartbeatResponse { .. } => {
+                        // do not care as follower
+                    },
                     Message::Heartbeat{req, resp } => {
                         if req.term > self.term {
                             self.term = req.term;
@@ -178,11 +187,13 @@ impl StateMachine {
                     Message::RequestVote { req, resp } => {
                         let _ = resp.send(self.request_vote(req).await.context("requesting vote"));
                     },
+                    Message::HeartbeatResponse { .. } => {
+                        // do not care as candidate
+                    },
                     Message::Heartbeat{req, resp } => {
                         if req.term > self.term {
                             // leader was elected and already send Heartbeat
                             self.term = req.term;
-                            self.set_term(req.term).await.context("setting new term")?;
                             debug!(term = req.term, "got AppendEntries with greater term");
                             self.convert_to_follower();
                         }
@@ -209,7 +220,12 @@ impl StateMachine {
     }
 
     async fn heartbeat(&mut self, req: grpc::HeartbeatRequest) -> Result<grpc::HeartbeatResponse> {
-        if req.term < self.term || req.leaderID >= self.servers.len() {
+        debug!(
+            leader_id = req.leader_id,
+            leader_term = req.term,
+            "got heartbeat"
+        );
+        if req.term < self.term || req.leader_id >= self.servers.len() as u32 {
             // stale leader or incorrect data, reject RPC
             return Ok(grpc::HeartbeatResponse {
                 term: self.term,
@@ -221,7 +237,7 @@ impl StateMachine {
             self.current_master
                 .write()
                 .await
-                .clone_from(self.servers[req.leaderID]);
+                .clone_from(&self.servers[req.leader_id as usize]);
         }
 
         Ok(grpc::HeartbeatResponse {
@@ -248,18 +264,22 @@ impl StateMachine {
             self.convert_to_follower();
         }
 
-        if self.voted_for.map_or(true, |v| v == req.candidate_id) && self.term <= req.term {
-            // if we haven't voted or or already voted for that candidate, vote for candidate
-            // if it's log is at least up-to-date as ours
-            self.voted_for = Some(req.candidate_id);
-            return Ok(grpc::RequestVoteResponse {
-                term: self.term,
-                vote_granted: true,
-            });
-        }
+        let vote_granted = match self.voted_for {
+            None if self.term <= req.term => true,
+            Some(candidate) => candidate == req.candidate_id,
+            _ => false,
+        };
+        debug!(
+            vote_granted = vote_granted,
+            my_term = self.term,
+            candidate_term = req.term,
+            candidate = req.candidate_id,
+            voted_for = self.voted_for,
+            "voting"
+        );
         Ok(grpc::RequestVoteResponse {
             term: self.term,
-            vote_granted: false,
+            vote_granted,
         })
     }
 
@@ -328,166 +348,62 @@ impl StateMachine {
         }
     }
 
-    async fn send_entries(&mut self, peer: PeerID, entries: Vec<grpc::LogEntry>) -> Result<()> {
-        let mut client = self.peers[peer].client.clone();
-        let msgs = self.tx_msgs.clone();
-        let _self = format!("{self}");
-        let prev_log_idx = self.peers[peer].next_idx - 1;
-
-        let entries_count = entries.len();
-        let update_timeout = Instant::now() + UPDATE_TIMEOUT;
-        self.peers[peer].update_timeout = Some(update_timeout);
-        self.peers[peer].next_heartbeat = Instant::now() + IDLE_TIMEOUT;
-        let prev_log_term = if prev_log_idx == 0 {
-            0
-        } else {
-            self.storage
-                .get_log_entry(prev_log_idx)
-                .await
-                .context("getting previous log entry")?
-                .term
-        };
-        let req = grpc::AppendEntriesRequest {
-            term: self.storage.current_term(),
-            leader_id: self.id as u32,
-            prev_log_index: prev_log_idx as u64,
-            prev_log_term,
-            entries,
-            leader_commit: self.commit_idx as u64,
-        };
-        task::spawn(async move {
-            select! {
-                _ = time::sleep_until(update_timeout) => {
-                    warn!(follower = peer, "AppendEntries timed out")
-                },
-                resp = client.append_entries(req) => {
-                    match resp {
-                        Ok(resp) => {
-                            let _ = msgs
-                                .send(Message::AppendEntriesResponse {
-                                    peer_id: peer,
-                                    replicated_index: if resp.into_inner().success {
-                                        Some(prev_log_idx + entries_count)
-                                    } else {
-                                        None
-                                    },
-                                })
-                                .await;
-                        }
-                        Err(err) => {
-                            // retries are supposed to be part of raft logic itself
-                            error!(follower = peer, error = format!("{err:#}"), "sending AppendEntries" );
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    async fn maybe_apply_log(&mut self) -> Result<bool> {
-        if self.commit_idx <= self.last_applied_idx {
-            return Ok(false);
-        }
-        self.last_applied_idx += 1;
-        debug_assert!(
-            self.last_applied_idx <= self.storage.last_log_idx(),
-            "(applying log entries) last_applied_idx > log last idx"
-        );
-
-        debug!(index = self.last_applied_idx, "applying log entry");
-        let cmd = self
-            .storage
-            .get_log_entry(self.last_applied_idx)
-            .await
-            .context("fetching latest log entry")?
-            .command
-            .clone()
-            .unwrap();
-        let old_value = self
-            .storage
-            .set(cmd.key, cmd.value)
-            .await
-            .context("applyng log entry to storage")?;
-        if let Some(chan) = self.pending_transactions.remove(&self.last_applied_idx) {
-            let _ = chan.send(old_value);
-        }
-        Ok(true)
-    }
-
-    async fn update_followers(&mut self) -> Result<()> {
-        let last_log_idx = self.storage.last_log_idx();
-        for peer_id in 0..self.peers.len() {
-            if peer_id == self.id {
-                continue;
-            }
-
-            let peer = &mut self.peers[peer_id];
-            let ok_to_update = peer.update_timeout.map_or(true, |x| Instant::now() >= x);
-            if !ok_to_update {
-                continue;
-            }
-
-            if peer.next_idx <= last_log_idx {
-                // peer is lagging
-                debug!(
-                    follower = peer_id,
-                    my_last_log_idx = last_log_idx,
-                    follower_next_idx = peer.next_idx,
-                    "updating follower"
-                );
-                let entries = self
-                    .storage
-                    .get_logs_since(peer.next_idx)
-                    .await
-                    .context("getting entries for follower")?;
-                self.send_entries(peer_id, entries)
-                    .await
-                    .context("sending entries to follower")?;
-            } else if Instant::now() >= peer.next_heartbeat {
-                self.send_entries(peer_id, Vec::new())
-                    .await
-                    .context("sending heartbeat")?;
-            }
+    async fn maybe_update_servers_health(&mut self) -> Result<()> {
+        for _server in self.servers.iter() {
+            // TODO: connect and check
         }
         Ok(())
     }
 
-    async fn maybe_update_commit_idx(&mut self) -> Result<()> {
-        debug_assert!(
-            self.commit_idx <= self.storage.last_log_idx(),
-            "(updating commitIndex) commitIndex <= log len"
-        );
-        if self.commit_idx == self.storage.last_log_idx() {
+    async fn maybe_update_followers(&mut self) -> Result<()> {
+        if Instant::now() < self.next_follower_update {
             return Ok(());
         }
-        let mut i = self.storage.last_log_idx();
-        while i > self.commit_idx {
-            let in_sync = self.peers.iter().filter(|p| p.match_idx >= i).count();
-            if in_sync >= self.quorum as usize
-                && self
-                    .storage
-                    .get_log_entry(i)
-                    .await
-                    .context("getting log entry")?
-                    .term
-                    == self.storage.current_term()
-            {
-                debug!(index = i, in_sync = in_sync, "got quorum on log entry");
-                self.commit_idx = i;
-                return Ok(());
+        self.next_follower_update = Instant::now() + HEARTBEAT_PERIOD;
+
+        for peer in self.peers.iter() {
+            if peer.id == self.id {
+                continue;
             }
-            i -= 1;
+            let mut client = peer.client.clone();
+            let peer_id = peer.id;
+            let update_timeout = Instant::now() + HEARTBEAT_TIMEOUT;
+            let current_master = { self.current_master.read().await.clone() };
+            let req = grpc::HeartbeatRequest {
+                term: self.term,
+                leader_id: self.id,
+                valkey_master: current_master,
+            };
+            let msgs = self.tx_msgs.clone();
+            task::spawn(async move {
+                select! {
+                    _ = time::sleep_until(update_timeout) => {
+                        warn!(peer_id = peer_id, "Update timed out");
+                    },
+                    resp = client.heartbeat(req) => {
+                        match resp {
+                            Ok(resp) => {
+                                let _ = msgs.send(Message::HeartbeatResponse(resp.into_inner())).await;
+                            }
+                            Err(err) => {
+                                error!(peer_id = peer_id, error = format!("{err:#}"), "sending Heartbeat");
+                            }
+                        }
+                    }
+                };
+            });
         }
         Ok(())
     }
 
-    fn init_peers(addrs: Vec<String>) -> Result<Vec<VkcpClient<Channel>>> {
-        let mut peers = Vec::with_capacity(addrs.len());
-        for addr in addrs.into_iter() {
-            println!("connected to {}", addr);
-            peers.push(VkcpClient::new(Channel::from_shared(addr)?.connect_lazy()))
+    fn init_peers(peer_configs: Vec<config::PeerConfig>) -> Result<Vec<PeerState>> {
+        let mut peers = Vec::with_capacity(peer_configs.len());
+        for peer in peer_configs.into_iter() {
+            println!("connected to {}", peer.addr);
+            peers.push(PeerState {
+                id: peer.id,
+                client: VkcpClient::new(Channel::from_shared(peer.addr)?.connect_lazy()),
+            })
         }
         Ok(peers)
     }
