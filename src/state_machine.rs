@@ -39,6 +39,8 @@ struct PeerState {
 
 #[derive(Debug)]
 struct ServerState {
+    addr: String,
+    healthy: bool,
     is_master: bool,
     offset: u64,
 }
@@ -67,7 +69,7 @@ pub struct StateMachine {
     election_timeout: Instant,
 
     // valkey servers status
-    servers: Vec<String>,
+    servers: Vec<ServerState>,
     current_master: Arc<RwLock<String>>,
 
     // volatile state
@@ -101,7 +103,15 @@ impl StateMachine {
             next_follower_update: Instant::now(),
             next_servers_ping: Instant::now(),
             votes_received: 0,
-            servers,
+            servers: servers
+                .into_iter()
+                .map(|addr| ServerState {
+                    healthy: false,
+                    addr,
+                    is_master: false,
+                    offset: 0,
+                })
+                .collect(),
             current_master,
             term: 0,
             voted_for: None,
@@ -249,7 +259,7 @@ impl StateMachine {
             self.current_master
                 .write()
                 .await
-                .clone_from(&self.servers[req.leader_id as usize]);
+                .clone_from(&self.servers[req.leader_id as usize].addr);
         }
 
         Ok(grpc::HeartbeatResponse {
@@ -363,18 +373,18 @@ impl StateMachine {
         }
         self.next_servers_ping = Instant::now() + VK_SERVER_CHECK_PERIOD;
 
-        for server in self.servers.iter() {
-            match Self::get_server_state(server).await {
+        for server in self.servers.iter_mut() {
+            match server.update_state().await {
                 Err(e) => {
                     error!(
-                        server = server,
+                        server = &server.addr,
                         error = format!("{e:#}"),
                         "getting server info"
                     );
                     continue;
                 }
-                Ok(state) => {
-                    debug!(server = server, state = ?state, "server state");
+                Ok(_) => {
+                    debug!(state = ?server, "server state");
                 }
             }
         }
@@ -441,9 +451,11 @@ impl StateMachine {
             ))
             .unwrap()
     }
+}
 
-    async fn get_server_state(addr: &str) -> Result<ServerState> {
-        let mut cfg = fredis::Config::from_url(&format!("redis://{addr}")).unwrap();
+impl ServerState {
+    async fn update_state(&mut self) -> Result<()> {
+        let mut cfg = fredis::Config::from_url(&format!("redis://{}", self.addr)).unwrap();
         cfg.fail_fast = true;
         let client = fredis::Builder::from_config(cfg)
             .with_connection_config(|cfg| {
@@ -455,38 +467,52 @@ impl StateMachine {
             })
             .build()
             .unwrap();
-        client.init().await.context("connecting to server")?;
+        if let Err(e) = client.init().await {
+            warn!(
+                server = self.addr,
+                error = format!("{e:#}"),
+                "connection to server failed"
+            );
+            self.healthy = false;
+            return Ok(());
+        }
 
-        let info: fredis::FredResult<String> =
-            client.info(Some(fred::types::InfoKind::Replication)).await;
+        let info: String = match client.info(Some(fred::types::InfoKind::Replication)).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    server = self.addr,
+                    error = format!("{e:#}"),
+                    "INFO command failed"
+                );
+                self.healthy = false;
+                return Ok(());
+            }
+        };
+
         if let Err(e) = client.quit().await {
             warn!(
-                server = addr,
+                server = self.addr,
                 error = format!("{e:#}"),
                 "closing connection"
             );
         }
 
-        let info = info.context("getting info")?;
-        let mut state = ServerState {
-            is_master: false,
-            offset: 0,
-        };
-
         for line in info.split("\r\n") {
             let mut p = line.split(":");
             match (p.next(), p.next()) {
-                (Some("role"), Some("master")) => state.is_master = true,
+                (Some("role"), Some("master")) => self.is_master = true,
                 (Some("slave_repl_offset"), Some(offset)) => {
-                    state.offset = offset.parse().unwrap_or_default();
+                    self.offset = offset.parse().unwrap_or_default();
                 }
                 (Some("master_repl_offset"), Some(offset)) => {
-                    state.offset = offset.parse().unwrap_or_default();
+                    self.offset = offset.parse().unwrap_or_default();
                 }
                 _ => {}
             }
         }
+        self.healthy = true;
 
-        Ok(state)
+        Ok(())
     }
 }
