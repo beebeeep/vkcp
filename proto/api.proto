@@ -10,7 +10,14 @@ service Vkcp {
 message HeartbeatRequest {
     uint64 term = 1;
     uint32 leaderID = 2;
-    string valkeyMaster = 3;
+    repeated ServerState servers = 3;
+}
+
+message ServerState {
+    bool healthy = 1;
+    bool is_master = 2;
+    uint64 offset = 3;
+    string addr = 4;
 }
 
 message HeartbeatResponse {
@@ -27,4 +34,3 @@ message RequestVoteResponse {
     uint64 term = 1;
     bool voteGranted = 2;
 }
-

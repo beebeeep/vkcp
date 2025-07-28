@@ -1,5 +1,4 @@
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config;
@@ -11,12 +10,12 @@ use fred::prelude::ClientLike;
 use rand::Rng;
 use rand::rng;
 use tokio::select;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
@@ -39,13 +38,12 @@ struct PeerState {
 
 #[derive(Debug)]
 struct ServerState {
-    addr: String,
-    healthy: bool,
-    is_master: bool,
-    offset: u64,
+    inner: grpc::ServerState,
+    context: Option<CancellationToken>,
 }
 
 pub enum Message {
+    // GRPC api
     RequestVote {
         req: grpc::RequestVoteRequest,
         resp: oneshot::Sender<Result<grpc::RequestVoteResponse>>,
@@ -58,6 +56,9 @@ pub enum Message {
     // messages from internal async jobs
     ReceiveVote(grpc::RequestVoteResponse),
     HeartbeatResponse(grpc::HeartbeatResponse),
+
+    // requests from proxying subsystem
+    GetCurrentMaster(oneshot::Sender<Option<(String, CancellationToken)>>),
 }
 
 pub struct StateMachine {
@@ -70,7 +71,6 @@ pub struct StateMachine {
 
     // valkey servers status
     servers: Vec<ServerState>,
-    current_master: Arc<RwLock<String>>,
 
     // volatile state
     state: MachineState,
@@ -87,7 +87,6 @@ impl StateMachine {
     pub fn new(
         id: u32,
         peers: Vec<config::PeerConfig>,
-        current_master: Arc<RwLock<String>>,
         servers: Vec<String>,
         rx_msgs: mpsc::Receiver<Message>,
         tx_msgs: mpsc::Sender<Message>,
@@ -106,13 +105,13 @@ impl StateMachine {
             servers: servers
                 .into_iter()
                 .map(|addr| ServerState {
-                    healthy: false,
-                    addr,
-                    is_master: false,
-                    offset: 0,
+                    inner: grpc::ServerState {
+                        addr,
+                        ..Default::default()
+                    },
+                    context: None,
                 })
                 .collect(),
-            current_master,
             term: 0,
             voted_for: None,
         })
@@ -153,17 +152,20 @@ impl StateMachine {
                     Message::HeartbeatResponse(resp) => {
                         if resp.term > self.term {
                             info!(term = resp.term, "got heartbeat response with greater term, converting to follower");
-                            self.convert_to_follower();
+                            self.convert_to_follower(resp.term);
                         }
                     },
                     Message::Heartbeat{req, resp } => {
                         if req.term > self.term {
                             info!(new_leader_id = req.leader_id, new_leader_term = req.term, "found new leader with greated term, converting to follower");
-                            self.convert_to_follower();
+                            self.convert_to_follower(req.term);
                             let _ = resp.send(self.heartbeat(req).await.context("processing Heartbeat"));
                         } else {
                             info!(offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
                         }
+                    },
+                    Message::GetCurrentMaster(resp) => {
+                        let _ = resp.send(self.get_current_master());
                     },
                 }
             }
@@ -188,10 +190,10 @@ impl StateMachine {
                         // do not care as follower
                     },
                     Message::Heartbeat{req, resp } => {
-                        if req.term > self.term {
-                            self.term = req.term;
-                        }
                         let _ = resp.send(self.heartbeat(req).await.context("processing AppendEntries"));
+                    },
+                    Message::GetCurrentMaster(resp) => {
+                        let _ = resp.send(self.get_current_master());
                     },
                 }
             }
@@ -215,9 +217,8 @@ impl StateMachine {
                     Message::Heartbeat{req, resp } => {
                         if req.term > self.term {
                             // leader was elected and already send Heartbeat
-                            self.term = req.term;
                             debug!(term = req.term, "got AppendEntries with greater term");
-                            self.convert_to_follower();
+                            self.convert_to_follower(req.term);
                         }
                         let _ = resp.send(self.heartbeat(req).await.context("processing Heartbeat"));
                     },
@@ -225,15 +226,22 @@ impl StateMachine {
                         info!(votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
                         if vote.term > self.term {
                             // we are stale
-                            self.term = vote.term;
-                            debug!(term = vote.term, "got RequestVote reply with greater term");
-                            self.convert_to_follower()
+                            debug!(req_term = vote.term, my_term = self.term,  "got RequestVote reply with greater term");
+                            self.convert_to_follower(vote.term)
                         } else if vote.term == self.term && vote.vote_granted {
                             self.votes_received += 1;
                             if self.votes_received >= self.quorum {
                                 self.convert_to_leader();
                             }
                         }
+                    },
+                    Message::GetCurrentMaster(resp) => {
+                        // Candidate nodes shall not proxy connections to master. This is a way to ensure that if the zone with current VK master
+                        // becomes isolated, so that new proxy leader won't be able to reach it and demote to slave, local proxies (which would be locked
+                        // in candidate state because they cannot get quorum) won't proxy write requests to old master thus creating data split-brain.
+                        // As a matter of fact, some data inconsistency is still possible because network partitioning cannot be detected instantly,
+                        // yet we are trying to minimize the impact
+                        let _ = resp.send(None);
                     },
                 }
             }
@@ -254,13 +262,11 @@ impl StateMachine {
                 success: false,
             });
         }
-        self.election_timeout = Self::next_election_timeout(None);
-        {
-            self.current_master
-                .write()
-                .await
-                .clone_from(&self.servers[req.leader_id as usize].addr);
+        if req.term > self.term {
+            self.term = req.term;
         }
+        self.election_timeout = Self::next_election_timeout(None);
+        self.update_servers(req.servers);
 
         Ok(grpc::HeartbeatResponse {
             term: self.term,
@@ -281,9 +287,13 @@ impl StateMachine {
         }
         if req.term > self.term {
             // candidate is more recent
-            self.term = req.term;
-            debug!(term = req.term, "got RequestVote with greater term");
-            self.convert_to_follower();
+            debug!(
+                req_term = req.term,
+                my_term = self.term,
+                candidate = req.candidate_id,
+                "got RequestVote with greater term"
+            );
+            self.convert_to_follower(req.term);
         }
 
         let vote_granted = match self.voted_for {
@@ -329,8 +339,9 @@ impl StateMachine {
         Ok(())
     }
 
-    fn convert_to_follower(&mut self) {
-        info!("converting to follower");
+    fn convert_to_follower(&mut self, new_term: u64) {
+        info!(new_term = new_term, "converting to follower");
+        self.term = new_term;
         self.state = MachineState::Follower;
     }
 
@@ -377,7 +388,7 @@ impl StateMachine {
             match server.update_state().await {
                 Err(e) => {
                     error!(
-                        server = &server.addr,
+                        server = &server.inner.addr,
                         error = format!("{e:#}"),
                         "getting server info"
                     );
@@ -404,11 +415,10 @@ impl StateMachine {
             let mut client = peer.client.clone();
             let peer_id = peer.id;
             let update_timeout = Instant::now() + HEARTBEAT_TIMEOUT;
-            let current_master = { self.current_master.read().await.clone() };
             let req = grpc::HeartbeatRequest {
                 term: self.term,
                 leader_id: self.id,
-                valkey_master: current_master,
+                servers: self.servers.iter().map(|x| x.inner.clone()).collect(),
             };
             let msgs = self.tx_msgs.clone();
             task::spawn(async move {
@@ -451,11 +461,33 @@ impl StateMachine {
             ))
             .unwrap()
     }
+
+    fn get_current_master(&self) -> Option<(String, CancellationToken)> {
+        self.servers
+            .iter()
+            .find(|s| s.inner.is_master && s.inner.healthy)
+            .map(|x| (x.inner.addr.clone(), x.context.as_ref().unwrap().clone()))
+    }
+
+    fn update_servers(&mut self, new_servers: Vec<grpc::ServerState>) {
+        for new in new_servers {
+            if let Some(old) = self.servers.iter_mut().find(|s| s.inner.addr == new.addr) {
+                if old.inner != new {
+                    // state changed, terminate all connections, setup new context if that's master and update the state
+                    old.cancel();
+                    if new.is_master && new.healthy {
+                        old.context = Some(CancellationToken::new());
+                    }
+                    old.inner = new;
+                }
+            }
+        }
+    }
 }
 
 impl ServerState {
     async fn update_state(&mut self) -> Result<()> {
-        let mut cfg = fredis::Config::from_url(&format!("redis://{}", self.addr)).unwrap();
+        let mut cfg = fredis::Config::from_url(&format!("redis://{}", self.inner.addr)).unwrap();
         cfg.fail_fast = true;
         let client = fredis::Builder::from_config(cfg)
             .with_connection_config(|cfg| {
@@ -469,11 +501,12 @@ impl ServerState {
             .unwrap();
         if let Err(e) = client.init().await {
             warn!(
-                server = self.addr,
+                server = self.inner.addr,
                 error = format!("{e:#}"),
                 "connection to server failed"
             );
-            self.healthy = false;
+            self.inner.healthy = false;
+            self.cancel();
             return Ok(());
         }
 
@@ -481,18 +514,19 @@ impl ServerState {
             Ok(v) => v,
             Err(e) => {
                 warn!(
-                    server = self.addr,
+                    server = self.inner.addr,
                     error = format!("{e:#}"),
                     "INFO command failed"
                 );
-                self.healthy = false;
+                self.inner.healthy = false;
+                self.cancel();
                 return Ok(());
             }
         };
 
         if let Err(e) = client.quit().await {
             warn!(
-                server = self.addr,
+                server = self.inner.addr,
                 error = format!("{e:#}"),
                 "closing connection"
             );
@@ -501,18 +535,35 @@ impl ServerState {
         for line in info.split("\r\n") {
             let mut p = line.split(":");
             match (p.next(), p.next()) {
-                (Some("role"), Some("master")) => self.is_master = true,
+                (Some("role"), Some("master")) => {
+                    self.inner.is_master = true;
+                    if self.context.is_none() {
+                        self.context = Some(CancellationToken::new());
+                    }
+                }
+                (Some("role"), Some("slave")) => {
+                    self.inner.is_master = false;
+                    self.cancel() // if there were any context, it should be cancelled now becaus it's slave
+                }
                 (Some("slave_repl_offset"), Some(offset)) => {
-                    self.offset = offset.parse().unwrap_or_default();
+                    self.inner.offset = offset.parse().unwrap_or_default();
                 }
                 (Some("master_repl_offset"), Some(offset)) => {
-                    self.offset = offset.parse().unwrap_or_default();
+                    self.inner.offset = offset.parse().unwrap_or_default();
                 }
                 _ => {}
             }
         }
-        self.healthy = true;
+        self.inner.healthy = true;
 
         Ok(())
+    }
+
+    /// cancel cancels underlying token so that everybody using that server get signalled
+    /// that something is wrong with server and it shall stop proxying there.
+    fn cancel(&mut self) {
+        if let Some(ctx) = self.context.take() {
+            ctx.cancel();
+        }
     }
 }

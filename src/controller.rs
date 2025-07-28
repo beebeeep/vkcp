@@ -1,7 +1,5 @@
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -19,13 +17,12 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(cfg: &config::Config, current_master: Arc<RwLock<String>>) -> Result<Self> {
+    pub fn new(cfg: &config::Config) -> Result<(Self, mpsc::Sender<state_machine::Message>)> {
         let (tx, rx) = mpsc::channel(8);
 
         let mut sm = state_machine::StateMachine::new(
             cfg.peer_id,
             cfg.peers.clone(),
-            current_master.clone(),
             cfg.servers.clone(),
             rx,
             tx.clone(),
@@ -33,7 +30,12 @@ impl Server {
         .context("initializing state machine")?;
         tokio::spawn(async move { sm.run().await });
 
-        Ok(Self { actions: tx })
+        Ok((
+            Self {
+                actions: tx.clone(),
+            },
+            tx,
+        ))
     }
 }
 
