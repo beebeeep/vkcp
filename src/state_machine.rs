@@ -39,7 +39,9 @@ struct PeerState {
 #[derive(Debug)]
 struct ServerState {
     inner: grpc::ServerState,
-    context: Option<CancellationToken>,
+
+    context: Option<CancellationToken>, // to signal proxies to terminate connection toward demoted master
+    replicaof: Option<String>,          // only on leader, for failovers
 }
 
 pub enum Message {
@@ -71,6 +73,7 @@ pub struct StateMachine {
 
     // valkey servers status
     servers: Vec<ServerState>,
+    preferred_master: Option<String>,
 
     // volatile state
     state: MachineState,
@@ -110,8 +113,10 @@ impl StateMachine {
                         ..Default::default()
                     },
                     context: None,
+                    replicaof: None,
                 })
                 .collect(),
+            preferred_master: None,
             term: 0,
             voted_for: None,
         })
@@ -532,6 +537,7 @@ impl ServerState {
             );
         }
 
+        let (mut master_host, mut master_port) = (None, None);
         for line in info.split("\r\n") {
             let mut p = line.split(":");
             match (p.next(), p.next()) {
@@ -543,7 +549,8 @@ impl ServerState {
                 }
                 (Some("role"), Some("slave")) => {
                     self.inner.is_master = false;
-                    self.cancel() // if there were any context, it should be cancelled now becaus it's slave
+                    self.replicaof = None;
+                    self.cancel() // if there were any context, it should be cancelled now because it's slave
                 }
                 (Some("slave_repl_offset"), Some(offset)) => {
                     self.inner.offset = offset.parse().unwrap_or_default();
@@ -551,11 +558,20 @@ impl ServerState {
                 (Some("master_repl_offset"), Some(offset)) => {
                     self.inner.offset = offset.parse().unwrap_or_default();
                 }
+                (Some("master_host"), Some(host)) => {
+                    master_host = Some(String::from(host));
+                }
+                (Some("master_port"), Some(port)) => {
+                    master_port = Some(port.parse::<u16>().unwrap_or_default());
+                }
                 _ => {}
             }
         }
         self.inner.healthy = true;
-
+        self.replicaof = match (master_host, master_port) {
+            (Some(h), Some(p)) => Some(format!("{h}:{p}")),
+            _ => None,
+        };
         Ok(())
     }
 

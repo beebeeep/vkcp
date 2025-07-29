@@ -1,7 +1,7 @@
 peer_id = 0
 ctrl_port = 50051
 proxy_port = 8081
-servers = [ "localhost:6379", "localhost:6378" ]
+servers = [ "vk1:6379", "vk2:6379" ]
 
 [[peers]]
   addr = "http://[::1]:50051"
