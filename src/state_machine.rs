@@ -16,6 +16,7 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tonic::IntoRequest;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
@@ -137,7 +138,7 @@ impl StateMachine {
     }
 
     async fn run_leader(&mut self) -> Result<()> {
-        self.maybe_update_servers_health()
+        self.maybe_update_servers()
             .await
             .context("updating followers")?;
         self.maybe_update_followers()
@@ -383,7 +384,7 @@ impl StateMachine {
         }
     }
 
-    async fn maybe_update_servers_health(&mut self) -> Result<()> {
+    async fn maybe_update_servers(&mut self) -> Result<()> {
         if Instant::now() < self.next_servers_ping {
             return Ok(());
         }
@@ -397,13 +398,91 @@ impl StateMachine {
                         error = format!("{e:#}"),
                         "getting server info"
                     );
-                    continue;
                 }
-                Ok(_) => {
-                    debug!(state = ?server, "server state");
+                Ok(_) => {}
+            }
+            debug!(state = ?server, "server state");
+        }
+
+        self.update_replication_topology()
+            .await
+            .context("updating replication topology")?;
+
+        Ok(())
+    }
+
+    fn select_preferred_master(&mut self) {
+        if let Some(m) = self.preferred_master.as_ref() {
+            // we already have selected master...
+            if self
+                .servers
+                .iter()
+                .find(|s| &s.inner.addr == m && s.inner.healthy && s.inner.is_master)
+                .is_some()
+            {
+                // ... it is healthy and actually master
+                return;
+            }
+        }
+
+        // we need to elect new master, select healthy replica with maximum offset
+        let mut candidate: Option<&ServerState> = None;
+        for s in self.servers.iter() {
+            if s.inner.healthy && s.inner.offset > candidate.map_or(0, |v| v.inner.offset) {
+                candidate = Some(s);
+            }
+        }
+        self.preferred_master = candidate.map(|v| v.inner.addr.clone());
+    }
+
+    async fn update_replication_topology(&mut self) -> Result<()> {
+        self.select_preferred_master();
+        if self.preferred_master.is_none() {
+            warn!("cannot find a suitable new master, all nodes are unhealthy");
+            return Ok(());
+        }
+
+        debug!(addr = ?self.preferred_master, "preferred master");
+
+        // now, ensure replication topology
+        let preferred_master = self.preferred_master.as_ref().unwrap();
+        for server in self.servers.iter_mut() {
+            if &server.inner.addr == preferred_master {
+                if !server.inner.is_master {
+                    if let Err(e) = server.promote().await {
+                        warn!(
+                            server = server.inner.addr,
+                            error = format!("{e:#}"),
+                            "failed to promote master"
+                        );
+                    } else {
+                        info!(server = server.inner.addr, "promoting master");
+                    }
+                }
+            } else {
+                if server
+                    .replicaof
+                    .as_ref()
+                    .map_or(true, |s| s != preferred_master)
+                {
+                    if let Err(e) = server.replicate_from(preferred_master).await {
+                        warn!(
+                            server = server.inner.addr,
+                            new_master = preferred_master,
+                            error = format!("{e:#}"),
+                            "failed to set replication"
+                        );
+                    } else {
+                        info!(
+                            server = server.inner.addr,
+                            new_master = preferred_master,
+                            "setting replication"
+                        );
+                    }
                 }
             }
         }
+
         Ok(())
     }
 
@@ -491,7 +570,7 @@ impl StateMachine {
 }
 
 impl ServerState {
-    async fn update_state(&mut self) -> Result<()> {
+    async fn connect(&mut self) -> Result<fredis::Client> {
         let mut cfg = fredis::Config::from_url(&format!("redis://{}", self.inner.addr)).unwrap();
         cfg.fail_fast = true;
         let client = fredis::Builder::from_config(cfg)
@@ -504,17 +583,24 @@ impl ServerState {
             })
             .build()
             .unwrap();
-        if let Err(e) = client.init().await {
-            warn!(
-                server = self.inner.addr,
-                error = format!("{e:#}"),
-                "connection to server failed"
-            );
-            self.inner.healthy = false;
-            self.cancel();
-            return Ok(());
+        match client.init().await {
+            Ok(_) => Ok(client),
+            Err(e) => {
+                warn!(
+                    server = self.inner.addr,
+                    error = format!("{e:#}"),
+                    "connection to server failed"
+                );
+                self.inner.healthy = false;
+                self.cancel();
+                Err(e).context("connecting to server")
+            }
         }
+    }
 
+    async fn update_state(&mut self) -> Result<()> {
+        self.inner.healthy = false;
+        let client = self.connect().await?;
         let info: String = match client.info(Some(fred::types::InfoKind::Replication)).await {
             Ok(v) => v,
             Err(e) => {
@@ -575,11 +661,44 @@ impl ServerState {
         Ok(())
     }
 
+    async fn promote(&mut self) -> Result<()> {
+        let client = self.connect().await?;
+        info!(server = self.inner.addr, "promoting server");
+        let _: () = client
+            .custom(fred::cmd!("REPLICAOF"), vec!["NO", "ONE"])
+            .await
+            .context("running REPLICAOF NO ONE")?;
+
+        // self.inner.is_master = true; // not really needed?
+        Ok(())
+    }
+
+    async fn replicate_from(&mut self, addr: &str) -> Result<()> {
+        let client = self.connect().await?;
+        let (host, port) = Self::get_host_port(addr);
+        let _: () = client
+            .custom(fred::cmd!("REPLICAOF"), vec![host, &port.to_string()])
+            .await
+            .context("running REPLICAOF")?;
+
+        Ok(())
+    }
+
     /// cancel cancels underlying token so that everybody using that server get signalled
     /// that something is wrong with server and it shall stop proxying there.
     fn cancel(&mut self) {
         if let Some(ctx) = self.context.take() {
             ctx.cancel();
+        }
+    }
+
+    fn get_host_port<'a>(addr: &'a str) -> (&'a str, u16) {
+        let mut p = addr.split(":");
+        match (p.next(), p.next()) {
+            (Some(h), Some(p)) => (h, p.parse().unwrap_or_default()),
+            _ => {
+                panic!("invalid address");
+            }
         }
     }
 }
