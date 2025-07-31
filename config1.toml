@@ -1,6 +1,6 @@
 peer_id = 0
-ctrl_port = 50051
-proxy_port = 8081
+ctrl_bind_addr = "[::1]:50051"
+proxy_bind_addr = "[::1]:8081"
 servers = [ "vk1:6379", "vk2:6379", "vk3:6379" ]
 
 [[peers]]

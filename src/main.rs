@@ -17,31 +17,24 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let cfg = vkcp::config::Config::new(&args.config)?;
-    let layer = tracing_subscriber::fmt::layer().compact();
+    let layer = tracing_subscriber::fmt::layer().json().flatten_event(true);
     let filter = EnvFilter::builder().parse(format!("info,vkcp={}", args.log_level))?;
     let subscriber = tracing_subscriber::registry().with(layer).with(filter);
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let ctrl_addr = format!(
-        "{}:{}",
-        cfg.host.clone().unwrap_or(String::from("[::1]")),
-        cfg.ctrl_port
-    )
-    .parse()?;
     let (ctrl, actions) = controller::Server::new(&cfg).context("starting controller")?;
 
     // starting valkey proxy
-    let proxy_addr = format!(
-        "{}:{}",
-        cfg.host.clone().unwrap_or(String::from("[::1]")),
-        cfg.proxy_port
-    );
-    tokio::spawn(vkcp::proxy::start_proxy(proxy_addr, actions));
+    tokio::spawn(vkcp::proxy::start_proxy(cfg.proxy_bind_addr, actions));
 
     // starting controller
     Server::builder()
         .add_service(VkcpServer::new(ctrl))
-        .serve(ctrl_addr)
+        .serve(
+            cfg.ctrl_bind_addr
+                .parse()
+                .context("parsing controller bind address")?,
+        )
         .await?;
 
     Ok(())

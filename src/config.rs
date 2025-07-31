@@ -12,8 +12,8 @@ pub struct PeerConfig {
 pub struct Config {
     pub peer_id: u32,
     pub host: Option<String>,
-    pub proxy_port: u16,
-    pub ctrl_port: u16,
+    pub proxy_bind_addr: String,
+    pub ctrl_bind_addr: String,
     pub peers: Vec<PeerConfig>,
     pub servers: Vec<String>,
 }
