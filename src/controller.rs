@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use autometrics::autometrics;
 use tokio::{
     sync::{mpsc, oneshot},
     time,
@@ -40,6 +41,7 @@ impl Server {
 
 #[tonic::async_trait]
 impl Vkcp for Server {
+    #[autometrics]
     async fn heartbeat(
         &self,
         req: Request<HeartbeatRequest>,
@@ -58,6 +60,7 @@ impl Vkcp for Server {
         }
     }
 
+    #[autometrics]
     async fn request_vote(
         &self,
         req: Request<RequestVoteRequest>,

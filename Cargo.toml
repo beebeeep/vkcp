@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+autometrics = { version = "2.0.0", features = ["prometheus-exporter"] }
+axum = "0.8.4"
 clap = { version = "4.5.41", features = ["derive"] }
 fred = "10.1.0"
 prost = "0.13"
