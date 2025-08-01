@@ -601,14 +601,15 @@ impl StateMachine {
     fn update_servers(&mut self, new_servers: Vec<grpc::ServerState>) {
         for new in new_servers {
             if let Some(old) = self.servers.iter_mut().find(|s| s.inner.addr == new.addr) {
-                if old.inner != new {
-                    // state changed, terminate all connections, setup new context if that's master and update the state
+                if !new.healthy {
+                    // server became unhealthy, terminate all connections
                     old.cancel();
-                    if new.is_master && new.healthy {
-                        old.context = Some(CancellationToken::new());
-                    }
-                    old.inner = new;
                 }
+                if !old.inner.is_master && new.is_master && new.healthy {
+                    // server was promoted and is healthy, setup context for clients
+                    old.context = Some(CancellationToken::new());
+                }
+                old.inner = new;
             }
         }
     }
