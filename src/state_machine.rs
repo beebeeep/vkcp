@@ -5,6 +5,7 @@ use crate::config;
 use crate::config::Config;
 use crate::grpc;
 use crate::grpc::vkcp_client::VkcpClient;
+use anyhow::anyhow;
 use anyhow::{Context, Result};
 use fred::prelude as fredis;
 use fred::prelude::ClientLike;
@@ -22,8 +23,8 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_HEARTBEAT_PERIOD: u64 = 1500; // main leader loop timeout
 const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 300;
-const DEFAULT_ELECTION_TIMEOUT_MS_MIN: u64 = 2500;
-const DEFAULT_ELECTION_TIMEOUT_MS_MAX: u64 = 3000;
+const DEFAULT_ELECTION_TIMEOUT_MS_MIN: u64 = 4000;
+const DEFAULT_ELECTION_TIMEOUT_MS_MAX: u64 = 6000;
 const DEFAULT_VK_SERVER_TIMEOUT: u64 = 500;
 const DEFAULT_VK_SERVER_CHECK_PERIOD: u64 = 2000;
 
@@ -70,7 +71,7 @@ pub struct StateMachine {
     rx_msgs: mpsc::Receiver<Message>,
     tx_msgs: mpsc::Sender<Message>,
     peers: Vec<PeerState>,
-    quorum: u32,
+    quorum: usize,
     election_timeout: Instant,
     heartbeat_period: Duration,
     heartbeat_timeout: Duration,
@@ -86,10 +87,11 @@ pub struct StateMachine {
     state: MachineState,
     term: u64,
     next_follower_update: Instant,
+    updates_pending: usize,
     next_servers_ping: Instant,
 
     // volatile state on candidate
-    votes_received: u32,
+    votes_received: usize,
     voted_for: Option<u32>,
 }
 
@@ -103,7 +105,7 @@ impl StateMachine {
             id: cfg.peer_id,
             rx_msgs,
             tx_msgs,
-            quorum: (cfg.peers.len() / 2 + 1) as u32,
+            quorum: (cfg.peers.len() / 2 + 1),
             peers: Self::init_peers(cfg.peers.clone())?,
             election_timeout_range: cfg
                 .election_timeout_ms_min
@@ -147,6 +149,7 @@ impl StateMachine {
             preferred_master: None,
             term: 0,
             voted_for: None,
+            updates_pending: 0,
         };
         r.set_election_timeout();
         Ok(r)
@@ -189,6 +192,9 @@ impl StateMachine {
                             info!(term = resp.term, "got heartbeat response with greater term, converting to follower");
                             self.convert_to_follower(resp.term);
                         }
+                        if resp.success {
+                            self.updates_pending -= 1;
+                        }
                     },
                     Message::Heartbeat{req, resp } => {
                         if req.term > self.term {
@@ -197,6 +203,7 @@ impl StateMachine {
                             let _ = resp.send(self.heartbeat(req).await.context("processing Heartbeat"));
                         } else {
                             info!(offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
+                            let _ = resp.send(Ok(grpc::HeartbeatResponse { term: self.term, success: false }));
                         }
                     },
                     Message::GetCurrentMaster(resp) => {
@@ -211,7 +218,7 @@ impl StateMachine {
     async fn run_follower(&mut self) -> Result<()> {
         select! {
             _ = time::sleep_until(self.election_timeout) => {
-                self.convert_to_candidate().await.context("converting to candidate")?;
+                self.convert_to_candidate().await;
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
@@ -240,7 +247,7 @@ impl StateMachine {
         select! {
             _ = time::sleep_until(self.election_timeout) => {
                 info!("heartbeat timed out");
-                self.convert_to_candidate().await.context("converting to candidate")?;
+                self.convert_to_candidate().await;
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
@@ -357,7 +364,7 @@ impl StateMachine {
         })
     }
 
-    async fn convert_to_candidate(&mut self) -> Result<()> {
+    async fn convert_to_candidate(&mut self) {
         info!("converting to candidate");
         self.state = MachineState::Candidate;
         self.term += 1;
@@ -378,7 +385,6 @@ impl StateMachine {
                 self.id,
             ));
         }
-        Ok(())
     }
 
     fn convert_to_follower(&mut self, new_term: u64) {
@@ -394,6 +400,7 @@ impl StateMachine {
         self.state = MachineState::Leader;
         self.voted_for = None;
         self.next_servers_ping = Instant::now();
+        self.updates_pending = 0;
     }
 
     fn set_term(&mut self, term: u64) {
@@ -538,7 +545,18 @@ impl StateMachine {
         if Instant::now() < self.next_follower_update {
             return Ok(());
         }
+
+        if self.updates_pending >= self.quorum {
+            // it is time to deliver next update, but we haven't yet get
+            // responses from quorum of followers, so we step down to candidate stat
+            self.convert_to_candidate().await;
+            return Err(anyhow!(
+                "did not received quorum of heartbeats: {} still pending",
+                self.updates_pending
+            ));
+        }
         self.next_follower_update = Instant::now() + self.heartbeat_period;
+        self.updates_pending = self.peers.len() - 1;
 
         for peer in self.peers.iter() {
             if peer.id == self.id {
