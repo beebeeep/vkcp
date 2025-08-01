@@ -1,5 +1,10 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time,
+};
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -20,14 +25,8 @@ impl Server {
     pub fn new(cfg: &config::Config) -> Result<(Self, mpsc::Sender<state_machine::Message>)> {
         let (tx, rx) = mpsc::channel(8);
 
-        let mut sm = state_machine::StateMachine::new(
-            cfg.peer_id,
-            cfg.peers.clone(),
-            cfg.servers.clone(),
-            rx,
-            tx.clone(),
-        )
-        .context("initializing state machine")?;
+        let mut sm = state_machine::StateMachine::new(&cfg, rx, tx.clone())
+            .context("initializing state machine")?;
         tokio::spawn(async move { sm.run().await });
 
         Ok((
@@ -45,6 +44,7 @@ impl Vkcp for Server {
         &self,
         req: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        time::sleep(Duration::from_millis(100)).await;
         let (tx, rx) = oneshot::channel();
         let msg = state_machine::Message::Heartbeat {
             req: req.into_inner(),

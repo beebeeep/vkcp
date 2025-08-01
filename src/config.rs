@@ -14,6 +14,14 @@ pub struct Config {
     pub host: Option<String>,
     pub proxy_bind_addr: String,
     pub ctrl_bind_addr: String,
+
+    pub heartbeat_period_ms: Option<u64>,
+    pub heartbeat_timeout_ms: Option<u64>,
+    pub election_timeout_ms_min: Option<u64>,
+    pub election_timeout_ms_max: Option<u64>,
+    pub vk_server_timeout_ms: Option<u64>,
+    pub vk_server_check_period_ms: Option<u64>,
+
     pub peers: Vec<PeerConfig>,
     pub servers: Vec<String>,
 }

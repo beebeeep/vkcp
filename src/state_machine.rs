@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use crate::config;
+use crate::config::Config;
 use crate::grpc;
 use crate::grpc::vkcp_client::VkcpClient;
 use anyhow::{Context, Result};
@@ -19,11 +20,12 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
-const HEARTBEAT_PERIOD: Duration = Duration::from_millis(1500); // main leader loop timeout
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(300);
-const ELECTION_TIMEOUT_MS: Range<u64> = 2500..3000;
-const VK_SERVER_TIMEOUT: Duration = Duration::from_millis(500);
-const VK_SERVER_CHECK_PERIOD: Duration = Duration::from_millis(2000);
+const DEFAULT_HEARTBEAT_PERIOD: u64 = 1500; // main leader loop timeout
+const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 300;
+const DEFAULT_ELECTION_TIMEOUT_MS_MIN: u64 = 2500;
+const DEFAULT_ELECTION_TIMEOUT_MS_MAX: u64 = 3000;
+const DEFAULT_VK_SERVER_TIMEOUT: u64 = 500;
+const DEFAULT_VK_SERVER_CHECK_PERIOD: u64 = 2000;
 
 pub enum MachineState {
     Leader,
@@ -70,6 +72,11 @@ pub struct StateMachine {
     peers: Vec<PeerState>,
     quorum: u32,
     election_timeout: Instant,
+    heartbeat_period: Duration,
+    heartbeat_timeout: Duration,
+    election_timeout_range: Range<u64>,
+    vk_server_timeout: Duration,
+    vk_server_check_period: Duration,
 
     // valkey servers status
     servers: Vec<ServerState>,
@@ -88,24 +95,45 @@ pub struct StateMachine {
 
 impl StateMachine {
     pub fn new(
-        id: u32,
-        peers: Vec<config::PeerConfig>,
-        servers: Vec<String>,
+        cfg: &Config,
         rx_msgs: mpsc::Receiver<Message>,
         tx_msgs: mpsc::Sender<Message>,
     ) -> Result<Self> {
-        Ok(Self {
-            id,
+        let mut r = Self {
+            id: cfg.peer_id,
             rx_msgs,
             tx_msgs,
-            quorum: (peers.len() / 2 + 1) as u32,
-            peers: Self::init_peers(peers)?,
-            election_timeout: Self::next_election_timeout(None),
+            quorum: (cfg.peers.len() / 2 + 1) as u32,
+            peers: Self::init_peers(cfg.peers.clone())?,
+            election_timeout_range: cfg
+                .election_timeout_ms_min
+                .unwrap_or(DEFAULT_ELECTION_TIMEOUT_MS_MIN)
+                ..cfg
+                    .election_timeout_ms_max
+                    .unwrap_or(DEFAULT_ELECTION_TIMEOUT_MS_MAX),
+            election_timeout: Instant::now(),
+            heartbeat_period: Duration::from_millis(
+                cfg.heartbeat_period_ms.unwrap_or(DEFAULT_HEARTBEAT_PERIOD),
+            ),
+            heartbeat_timeout: Duration::from_millis(
+                cfg.heartbeat_timeout_ms
+                    .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT),
+            ),
+            vk_server_timeout: Duration::from_millis(
+                cfg.vk_server_timeout_ms
+                    .unwrap_or(DEFAULT_VK_SERVER_TIMEOUT),
+            ),
+            vk_server_check_period: Duration::from_millis(
+                cfg.vk_server_check_period_ms
+                    .unwrap_or(DEFAULT_VK_SERVER_CHECK_PERIOD),
+            ),
             state: MachineState::Follower,
             next_follower_update: Instant::now(),
             next_servers_ping: Instant::now(),
             votes_received: 0,
-            servers: servers
+            servers: cfg
+                .servers
+                .clone()
                 .into_iter()
                 .map(|addr| ServerState {
                     inner: grpc::ServerState {
@@ -119,7 +147,9 @@ impl StateMachine {
             preferred_master: None,
             term: 0,
             voted_for: None,
-        })
+        };
+        r.election_timeout = r.next_election_timeout();
+        Ok(r)
     }
 
     pub async fn run(&mut self) {
@@ -145,7 +175,7 @@ impl StateMachine {
             .context("updating commitIndex")?;
 
         select! {
-            _ = time::sleep(HEARTBEAT_PERIOD) => {},
+            _ = time::sleep(self.heartbeat_period) => {},
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::RequestVote { req, resp } => {
@@ -209,6 +239,7 @@ impl StateMachine {
     async fn run_candidate(&mut self) -> Result<()> {
         select! {
             _ = time::sleep_until(self.election_timeout) => {
+                info!("heartbeat timed out");
                 self.convert_to_candidate().await.context("converting to candidate")?;
             },
             Some(msg) = self.rx_msgs.recv() => {
@@ -231,8 +262,9 @@ impl StateMachine {
                         info!(votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
                         if vote.term > self.term {
                             // we are stale
-                            debug!(req_term = vote.term, my_term = self.term,  "got RequestVote reply with greater term");
+                            debug!(vote = ?vote, my_term = self.term,  "got RequestVote reply with greater term");
                             self.convert_to_follower(vote.term)
+
                         } else if vote.term == self.term && vote.vote_granted {
                             self.votes_received += 1;
                             if self.votes_received >= self.quorum {
@@ -268,9 +300,9 @@ impl StateMachine {
             });
         }
         if req.term > self.term {
-            self.term = req.term;
+            self.set_term(req.term);
         }
-        self.election_timeout = Self::next_election_timeout(None);
+        self.election_timeout = self.next_election_timeout();
         self.update_servers(req.servers);
 
         Ok(grpc::HeartbeatResponse {
@@ -326,7 +358,7 @@ impl StateMachine {
         self.term += 1;
         self.voted_for = Some(self.id);
         self.votes_received = 1;
-        self.election_timeout = Self::next_election_timeout(None);
+        self.election_timeout = self.next_election_timeout();
 
         // request votes from all peers in parallel
         for peer in self.peers.iter() {
@@ -346,13 +378,21 @@ impl StateMachine {
 
     fn convert_to_follower(&mut self, new_term: u64) {
         info!(new_term = new_term, "converting to follower");
-        self.term = new_term;
+        self.set_term(new_term);
         self.state = MachineState::Follower;
+        self.voted_for = None;
     }
 
     fn convert_to_leader(&mut self) {
         info!("converting to leader");
         self.state = MachineState::Leader;
+        self.voted_for = None;
+        self.next_servers_ping = Instant::now();
+    }
+
+    fn set_term(&mut self, term: u64) {
+        self.term = term;
+        self.voted_for = None;
     }
 
     async fn request_vote_from_peer(
@@ -384,13 +424,13 @@ impl StateMachine {
     }
 
     async fn maybe_update_servers(&mut self) -> Result<()> {
-        if Instant::now() < self.next_servers_ping {
+        if Instant::now() <= self.next_servers_ping {
             return Ok(());
         }
-        self.next_servers_ping = Instant::now() + VK_SERVER_CHECK_PERIOD;
+        self.next_servers_ping = Instant::now() + self.vk_server_check_period;
 
         for server in self.servers.iter_mut() {
-            match server.update_state().await {
+            match server.update_state(self.vk_server_timeout).await {
                 Err(e) => {
                     error!(
                         server = &server.inner.addr,
@@ -425,9 +465,12 @@ impl StateMachine {
         }
 
         // we need to elect new master, select healthy replica with maximum offset
+        // NB: if all servers are masters (i.e. they just started and they weren't initially configured for replication
+        // as we don't require that), they will have offset of 0, so below code will select last one in list
+        // as preferred master
         let mut candidate: Option<&ServerState> = None;
         for s in self.servers.iter() {
-            if s.inner.healthy && s.inner.offset > candidate.map_or(0, |v| v.inner.offset) {
+            if s.inner.healthy && s.inner.offset >= candidate.map_or(0, |v| v.inner.offset) {
                 candidate = Some(s);
             }
         }
@@ -448,7 +491,7 @@ impl StateMachine {
         for server in self.servers.iter_mut() {
             if &server.inner.addr == preferred_master {
                 if !server.inner.is_master {
-                    if let Err(e) = server.promote().await {
+                    if let Err(e) = server.promote(self.vk_server_timeout).await {
                         warn!(
                             server = server.inner.addr,
                             error = format!("{e:#}"),
@@ -464,7 +507,10 @@ impl StateMachine {
                     .as_ref()
                     .map_or(true, |s| s != preferred_master)
                 {
-                    if let Err(e) = server.replicate_from(preferred_master).await {
+                    if let Err(e) = server
+                        .replicate_from(preferred_master, self.vk_server_timeout)
+                        .await
+                    {
                         warn!(
                             server = server.inner.addr,
                             new_master = preferred_master,
@@ -489,7 +535,7 @@ impl StateMachine {
         if Instant::now() < self.next_follower_update {
             return Ok(());
         }
-        self.next_follower_update = Instant::now() + HEARTBEAT_PERIOD;
+        self.next_follower_update = Instant::now() + self.heartbeat_period;
 
         for peer in self.peers.iter() {
             if peer.id == self.id {
@@ -497,7 +543,7 @@ impl StateMachine {
             }
             let mut client = peer.client.clone();
             let peer_id = peer.id;
-            let update_timeout = Instant::now() + HEARTBEAT_TIMEOUT;
+            let update_timeout = Instant::now() + self.heartbeat_timeout;
             let req = grpc::HeartbeatRequest {
                 term: self.term,
                 leader_id: self.id,
@@ -537,10 +583,10 @@ impl StateMachine {
         Ok(peers)
     }
 
-    fn next_election_timeout(r: Option<Range<u64>>) -> Instant {
+    fn next_election_timeout(&self) -> Instant {
         Instant::now()
             .checked_add(Duration::from_millis(
-                rng().random_range(r.unwrap_or(ELECTION_TIMEOUT_MS)),
+                rng().random_range(self.election_timeout_range.clone()),
             ))
             .unwrap()
     }
@@ -569,12 +615,12 @@ impl StateMachine {
 }
 
 impl ServerState {
-    async fn connect(&mut self) -> Result<fredis::Client> {
+    async fn connect(&mut self, timeout: Duration) -> Result<fredis::Client> {
         let mut cfg = fredis::Config::from_url(&format!("redis://{}", self.inner.addr)).unwrap();
         cfg.fail_fast = true;
         let client = fredis::Builder::from_config(cfg)
             .with_connection_config(|cfg| {
-                cfg.connection_timeout = VK_SERVER_TIMEOUT;
+                cfg.connection_timeout = timeout;
                 cfg.tcp = fredis::TcpConfig {
                     nodelay: Some(true),
                     ..Default::default()
@@ -597,9 +643,9 @@ impl ServerState {
         }
     }
 
-    async fn update_state(&mut self) -> Result<()> {
+    async fn update_state(&mut self, timeout: Duration) -> Result<()> {
         self.inner.healthy = false;
-        let client = self.connect().await?;
+        let client = self.connect(timeout).await?;
         let info: String = match client.info(Some(fred::types::InfoKind::Replication)).await {
             Ok(v) => v,
             Err(e) => {
@@ -660,8 +706,8 @@ impl ServerState {
         Ok(())
     }
 
-    async fn promote(&mut self) -> Result<()> {
-        let client = self.connect().await?;
+    async fn promote(&mut self, timeout: Duration) -> Result<()> {
+        let client = self.connect(timeout).await?;
         info!(server = self.inner.addr, "promoting server");
         let _: () = client
             .custom(fred::cmd!("REPLICAOF"), vec!["NO", "ONE"])
@@ -672,8 +718,8 @@ impl ServerState {
         Ok(())
     }
 
-    async fn replicate_from(&mut self, addr: &str) -> Result<()> {
-        let client = self.connect().await?;
+    async fn replicate_from(&mut self, addr: &str, timeout: Duration) -> Result<()> {
+        let client = self.connect(timeout).await?;
         let (host, port) = Self::get_host_port(addr);
         let _: () = client
             .custom(fred::cmd!("REPLICAOF"), vec![host, &port.to_string()])
