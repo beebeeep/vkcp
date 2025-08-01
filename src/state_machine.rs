@@ -58,7 +58,7 @@ pub enum Message {
     },
 
     // messages from internal async jobs
-    ReceiveVote(grpc::RequestVoteResponse),
+    ReceiveVote((u32, grpc::RequestVoteResponse)),
     HeartbeatResponse(grpc::HeartbeatResponse),
 
     // requests from proxying subsystem
@@ -148,7 +148,7 @@ impl StateMachine {
             term: 0,
             voted_for: None,
         };
-        r.election_timeout = r.next_election_timeout();
+        r.set_election_timeout();
         Ok(r)
     }
 
@@ -258,8 +258,8 @@ impl StateMachine {
                         }
                         let _ = resp.send(self.heartbeat(req).await.context("processing Heartbeat"));
                     },
-                    Message::ReceiveVote(vote) => {
-                        info!(votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
+                    Message::ReceiveVote((peer_id, vote)) => {
+                        info!(voter = peer_id, votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
                         if vote.term > self.term {
                             // we are stale
                             debug!(vote = ?vote, my_term = self.term,  "got RequestVote reply with greater term");
@@ -302,7 +302,7 @@ impl StateMachine {
         if req.term > self.term {
             self.set_term(req.term);
         }
-        self.election_timeout = self.next_election_timeout();
+        self.set_election_timeout();
         self.update_servers(req.servers);
 
         Ok(grpc::HeartbeatResponse {
@@ -358,7 +358,7 @@ impl StateMachine {
         self.term += 1;
         self.voted_for = Some(self.id);
         self.votes_received = 1;
-        self.election_timeout = self.next_election_timeout();
+        self.set_election_timeout();
 
         // request votes from all peers in parallel
         for peer in self.peers.iter() {
@@ -381,6 +381,7 @@ impl StateMachine {
         self.set_term(new_term);
         self.state = MachineState::Follower;
         self.voted_for = None;
+        self.set_election_timeout();
     }
 
     fn convert_to_leader(&mut self) {
@@ -406,10 +407,7 @@ impl StateMachine {
         match client.request_vote(req).await {
             Ok(repl) => {
                 let repl = repl.into_inner();
-                let msg = Message::ReceiveVote(grpc::RequestVoteResponse {
-                    term: repl.term,
-                    vote_granted: repl.vote_granted,
-                });
+                let msg = Message::ReceiveVote((peer_id, repl));
                 let _ = msgs.send(msg).await;
             }
             Err(err) => {
@@ -583,12 +581,12 @@ impl StateMachine {
         Ok(peers)
     }
 
-    fn next_election_timeout(&self) -> Instant {
-        Instant::now()
+    fn set_election_timeout(&mut self) {
+        self.election_timeout = Instant::now()
             .checked_add(Duration::from_millis(
                 rng().random_range(self.election_timeout_range.clone()),
             ))
-            .unwrap()
+            .unwrap();
     }
 
     fn get_current_master(&self) -> Option<(String, CancellationToken)> {
