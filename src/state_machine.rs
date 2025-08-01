@@ -290,6 +290,11 @@ impl StateMachine {
         debug!(
             leader_id = req.leader_id,
             leader_term = req.term,
+            current_master = req
+                .servers
+                .iter()
+                .find(|s| s.healthy && s.is_master)
+                .map_or("N/A", |s| s.addr.as_str()),
             "got heartbeat"
         );
         if req.term < self.term || req.leader_id >= self.servers.len() as u32 {
@@ -615,18 +620,20 @@ impl StateMachine {
 
 impl ServerState {
     async fn connect(&mut self, timeout: Duration) -> Result<fredis::Client> {
-        let mut cfg = fredis::Config::from_url(&format!("redis://{}", self.inner.addr)).unwrap();
+        let mut cfg = fredis::Config::from_url(&format!("redis://{}", self.inner.addr))?;
         cfg.fail_fast = true;
-        let client = fredis::Builder::from_config(cfg)
-            .with_connection_config(|cfg| {
-                cfg.connection_timeout = timeout;
-                cfg.tcp = fredis::TcpConfig {
-                    nodelay: Some(true),
-                    ..Default::default()
-                };
-            })
-            .build()
-            .unwrap();
+        let mut builder = fredis::Builder::from_config(cfg);
+        builder.with_connection_config(|cfg| {
+            cfg.connection_timeout = timeout;
+            cfg.connection_timeout = timeout;
+            cfg.tcp = fredis::TcpConfig {
+                nodelay: Some(true),
+                ..Default::default()
+            };
+        });
+        builder.set_policy(fredis::ReconnectPolicy::new_linear(1, 10, 10));
+
+        let client = builder.build().context("building client")?;
         match client.init().await {
             Ok(_) => Ok(client),
             Err(e) => {

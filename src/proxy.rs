@@ -4,7 +4,7 @@ use tokio::{
     select,
     sync::{mpsc::Sender, oneshot},
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::state_machine;
 
@@ -31,7 +31,13 @@ async fn proxy_connection(mut ingress: TcpStream, actions: Sender<state_machine:
     }
     match rx.await {
         Ok(Some((addr, context))) => {
-            let mut egress = TcpStream::connect(addr).await.unwrap();
+            let mut egress = match TcpStream::connect(addr).await {
+                Ok(e) => e,
+                Err(e) => {
+                    error!(error = format!("{e:#}"), "connecting to valkey");
+                    return;
+                }
+            };
             select! {
                 _ = context.cancelled() => {
                     // master was demoted and/or became unhealthy
