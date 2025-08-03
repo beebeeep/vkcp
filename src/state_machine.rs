@@ -172,17 +172,17 @@ impl StateMachine {
     async fn run_leader(&mut self) -> Result<()> {
         self.maybe_update_servers()
             .await
-            .context("updating followers")?;
+            .context("updating servers")?;
         self.maybe_update_followers()
             .await
-            .context("updating commitIndex")?;
+            .context("updating followers")?;
 
         select! {
             _ = time::sleep(self.heartbeat_period) => {},
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.request_vote(req).await.context("voting for candidate")); // NB: not clear what shall we do here?
+                        let _ = resp.send(self.process_request_vote(req).await.context("voting for candidate")); // NB: not clear what shall we do here?
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as we are leader already
@@ -223,7 +223,7 @@ impl StateMachine {
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.request_vote(req).await.context("requesting vote"));
+                        let _ = resp.send(self.process_request_vote(req).await.context("requesting vote"));
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as follower
@@ -252,7 +252,7 @@ impl StateMachine {
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.request_vote(req).await.context("requesting vote"));
+                        let _ = resp.send(self.process_request_vote(req).await.context("requesting vote"));
                     },
                     Message::HeartbeatResponse { .. } => {
                         // do not care as candidate
@@ -323,7 +323,7 @@ impl StateMachine {
         })
     }
 
-    async fn request_vote(
+    async fn process_request_vote(
         &mut self,
         req: grpc::RequestVoteRequest,
     ) -> Result<grpc::RequestVoteResponse> {
@@ -400,6 +400,7 @@ impl StateMachine {
         self.state = MachineState::Leader;
         self.voted_for = None;
         self.next_servers_ping = Instant::now();
+        self.next_follower_update = Instant::now();
         self.updates_pending = 0;
     }
 
@@ -434,7 +435,7 @@ impl StateMachine {
     }
 
     async fn maybe_update_servers(&mut self) -> Result<()> {
-        if Instant::now() <= self.next_servers_ping {
+        if Instant::now() < self.next_servers_ping {
             return Ok(());
         }
         self.next_servers_ping = Instant::now() + self.vk_server_check_period;
@@ -557,6 +558,7 @@ impl StateMachine {
         }
         self.next_follower_update = Instant::now() + self.heartbeat_period;
         self.updates_pending = self.peers.len() - 1;
+        debug!("sending heartbeats");
 
         for peer in self.peers.iter() {
             if peer.id == self.id {
@@ -579,7 +581,9 @@ impl StateMachine {
                     resp = client.heartbeat(req) => {
                         match resp {
                             Ok(resp) => {
-                                let _ = msgs.send(Message::HeartbeatResponse(resp.into_inner())).await;
+                                let resp = resp.into_inner();
+                                debug!(follower = peer_id, success = resp.success, "follower Heartbeat response");
+                                let _ = msgs.send(Message::HeartbeatResponse(resp)).await;
                             }
                             Err(err) => {
                                 error!(peer_id = peer_id, error = format!("{err:#}"), "sending Heartbeat");
