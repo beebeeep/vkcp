@@ -304,8 +304,14 @@ impl StateMachine {
                 .map_or("N/A", |s| s.addr.as_str()),
             "got heartbeat"
         );
-        if req.term < self.term || req.leader_id >= self.servers.len() as u32 {
+        if req.term < self.term || req.leader_id >= self.peers.len() as u32 {
             // stale leader or incorrect data, reject RPC
+            debug!(
+                term = self.term,
+                req_term = req.term,
+                leader = req.leader_id,
+                "heartbeat from stale leader"
+            );
             return Ok(grpc::HeartbeatResponse {
                 term: self.term,
                 success: false,
