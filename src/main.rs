@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = EnvFilter::builder().parse(format!("info,vkcp={}", args.log_level))?;
     let subscriber = tracing_subscriber::registry().with(layer).with(filter);
     tracing::subscriber::set_global_default(subscriber)?;
-    // TODO: start state machine separately
+
     let (ctrl, actions) = controller::Server::new(&cfg).context("starting controller")?;
 
     let mut tasks = Vec::new();

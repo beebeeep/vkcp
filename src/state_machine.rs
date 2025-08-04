@@ -82,7 +82,6 @@ pub struct StateMachine {
     tx_msgs: mpsc::Sender<Message>,
     peers: Vec<PeerState>,
     quorum: usize,
-    election_timeout: Instant,
     heartbeat_period: Duration,
     heartbeat_timeout: Duration,
     election_timeout_range: Range<u64>,
@@ -124,7 +123,6 @@ impl StateMachine {
                 ..cfg
                     .election_timeout_ms_max
                     .unwrap_or(DEFAULT_ELECTION_TIMEOUT_MS_MAX),
-            election_timeout: Instant::now(),
             heartbeat_period: Duration::from_millis(
                 cfg.heartbeat_period_ms.unwrap_or(DEFAULT_HEARTBEAT_PERIOD),
             ),
@@ -166,7 +164,6 @@ impl StateMachine {
                 .clone()
                 .map_or(vec![], |tags| tags.into_iter().collect()),
         };
-        r.set_election_timeout();
         r.tags.push((String::from("peer_id"), format!("{}", r.id)));
         Ok(r)
     }
@@ -220,7 +217,11 @@ impl StateMachine {
                             self.convert_to_follower(req.term);
                             let _ = resp.send(self.heartbeat(req).await.context("processing Heartbeat"));
                         } else {
+                            // this really isn't supposed to happen, yet just in case we step
                             info!(offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
+                            self.convert_to_follower(req.term);
+                            // but don't acknowledge the heartbeat, leader will either send us a new one next time,
+                            // or step down too if it failed to get a quorum
                             let _ = resp.send(Ok(grpc::HeartbeatResponse { term: self.term, success: false }));
                         }
                     },
@@ -235,7 +236,7 @@ impl StateMachine {
 
     async fn run_follower(&mut self) -> Result<()> {
         select! {
-            _ = time::sleep_until(self.election_timeout) => {
+            _ = time::sleep_until(self.get_election_timeout()) => {
                 self.convert_to_candidate().await;
             },
             Some(msg) = self.rx_msgs.recv() => {
@@ -263,7 +264,7 @@ impl StateMachine {
 
     async fn run_candidate(&mut self) -> Result<()> {
         select! {
-            _ = time::sleep_until(self.election_timeout) => {
+            _ = time::sleep_until(self.get_election_timeout()) => {
                 info!("heartbeat timed out");
                 self.convert_to_candidate().await;
             },
@@ -339,7 +340,6 @@ impl StateMachine {
         if req.term > self.term {
             self.set_term(req.term);
         }
-        self.set_election_timeout();
         self.update_servers(req.servers);
         counter!(METRIC_HEARTBEAT_OK, &self.tags).increment(1);
 
@@ -396,7 +396,6 @@ impl StateMachine {
         self.term += 1;
         self.voted_for = Some(self.id);
         self.votes_received = 1;
-        self.set_election_timeout();
 
         // request votes from all peers in parallel
         for peer in self.peers.iter() {
@@ -418,7 +417,6 @@ impl StateMachine {
         self.set_term(new_term);
         self.state = MachineState::Follower;
         self.voted_for = None;
-        self.set_election_timeout();
     }
 
     fn convert_to_leader(&mut self) {
@@ -650,12 +648,12 @@ impl StateMachine {
         Ok(peers)
     }
 
-    fn set_election_timeout(&mut self) {
-        self.election_timeout = Instant::now()
+    fn get_election_timeout(&mut self) -> Instant {
+        Instant::now()
             .checked_add(Duration::from_millis(
                 rng().random_range(self.election_timeout_range.clone()),
             ))
-            .unwrap();
+            .unwrap()
     }
 
     fn get_current_master(&self) -> Option<(String, CancellationToken)> {
