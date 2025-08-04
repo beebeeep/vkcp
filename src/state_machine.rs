@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use anyhow::{Context, Result};
 use fred::prelude as fredis;
 use fred::prelude::ClientLike;
+use metrics::{counter, gauge};
 use rand::Rng;
 use rand::rng;
 use tokio::select;
@@ -28,10 +29,20 @@ const DEFAULT_ELECTION_TIMEOUT_MS_MAX: u64 = 6000;
 const DEFAULT_VK_SERVER_TIMEOUT: u64 = 500;
 const DEFAULT_VK_SERVER_CHECK_PERIOD: u64 = 2000;
 
+const METRIC_HEARTBEAT_FAIL: &str = "vkcp.election.follower.heartbeat.fails";
+const METRIC_HEARTBEAT_OK: &str = "vkcp.election.follower.heartbeat.oks";
+const METRIC_NODE_STATE: &str = "vkcp.election.state";
+const METRIC_NODE_TERM: &str = "vkcp.election.term";
+const METRIC_HEARTBEATS_SENT_OK: &str = "vkcp.election.leader.heartbeat.sent";
+const METRIC_HEARTBEATS_SENT_ERR: &str = "vkcp.election.leader.heartbeat.error";
+const METRIC_SERVER_HEALTHY: &str = "vkcp.server.healthcheck.healthy";
+const METRIC_SERVER_MASTERS: &str = "vkcp.server.healthcheck.masters";
+
+#[derive(Copy, Clone)]
 pub enum MachineState {
-    Leader,
-    Follower,
-    Candidate,
+    Leader = 0,
+    Follower = 1,
+    Candidate = 2,
 }
 
 struct PeerState {
@@ -157,6 +168,8 @@ impl StateMachine {
 
     pub async fn run(&mut self) {
         loop {
+            gauge!(METRIC_NODE_STATE).set(self.state as i32);
+            gauge!(METRIC_NODE_TERM).set(self.term as f64);
             let err = match self.state {
                 MachineState::Leader => self.run_leader().await,
                 MachineState::Follower => self.run_follower().await,
@@ -312,6 +325,7 @@ impl StateMachine {
                 leader = req.leader_id,
                 "heartbeat from stale leader"
             );
+            counter!(METRIC_HEARTBEAT_FAIL).increment(1);
             return Ok(grpc::HeartbeatResponse {
                 term: self.term,
                 success: false,
@@ -322,6 +336,7 @@ impl StateMachine {
         }
         self.set_election_timeout();
         self.update_servers(req.servers);
+        counter!(METRIC_HEARTBEAT_OK).increment(1);
 
         Ok(grpc::HeartbeatResponse {
             term: self.term,
@@ -446,6 +461,7 @@ impl StateMachine {
         }
         self.next_servers_ping = Instant::now() + self.vk_server_check_period;
 
+        let (mut masters, mut healthy) = (0, 0);
         for server in self.servers.iter_mut() {
             match server.update_state(self.vk_server_timeout).await {
                 Err(e) => {
@@ -457,8 +473,16 @@ impl StateMachine {
                 }
                 Ok(_) => {}
             }
+            if server.inner.healthy {
+                healthy += 1;
+            }
+            if server.inner.is_master {
+                masters += 1;
+            }
             debug!(state = ?server, "server state");
         }
+        gauge!(METRIC_SERVER_HEALTHY).set(healthy);
+        gauge!(METRIC_SERVER_MASTERS).set(masters);
 
         self.update_replication_topology()
             .await
@@ -587,11 +611,13 @@ impl StateMachine {
                     resp = client.heartbeat(req) => {
                         match resp {
                             Ok(resp) => {
+                                counter!(METRIC_HEARTBEATS_SENT_OK).increment(1);
                                 let resp = resp.into_inner();
                                 debug!(follower = peer_id, success = resp.success, "follower Heartbeat response");
                                 let _ = msgs.send(Message::HeartbeatResponse(resp)).await;
                             }
                             Err(err) => {
+                                counter!(METRIC_HEARTBEATS_SENT_ERR).increment(1);
                                 error!(peer_id = peer_id, error = format!("{err:#}"), "sending Heartbeat");
                             }
                         }

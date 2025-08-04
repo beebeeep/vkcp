@@ -1,9 +1,8 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::Context;
-use autometrics::prometheus_exporter;
 use clap::Parser;
-use tokio::net::TcpListener;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tonic::transport::Server;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
@@ -52,21 +51,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     // starting metrics
-    prometheus_exporter::init();
-    let exporter = axum::Router::new().route(
-        "/metrics",
-        axum::routing::get(|| async { prometheus_exporter::encode_http_response() }),
-    );
-    let metrics_listener = TcpListener::bind(SocketAddrV4::new(
-        Ipv4Addr::new(0, 0, 0, 0),
-        args.prometheus_port,
-    ))
-    .await?;
-    tasks.push(tokio::spawn(async move {
-        axum::serve(metrics_listener, exporter)
-            .await
-            .context("serving metrics")
-    }));
+    let builder = PrometheusBuilder::new();
+    builder
+        .with_http_listener(SocketAddrV4::new(
+            Ipv4Addr::new(0, 0, 0, 0),
+            args.prometheus_port,
+        ))
+        .install()
+        .context("starting metrics")?;
 
     for task in tasks {
         if let Err(e) = task.await {
