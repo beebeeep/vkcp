@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
-use std::fs;
+use std::{collections::HashMap, fs};
 
 #[derive(Deserialize, Clone)]
 pub struct PeerConfig {
@@ -24,6 +24,8 @@ pub struct Config {
 
     pub peers: Vec<PeerConfig>,
     pub servers: Vec<String>,
+
+    pub extra_tags: Option<HashMap<String, String>>,
 }
 
 impl Config {

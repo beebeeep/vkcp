@@ -17,17 +17,22 @@ const METRIC_PROXY_DENIED: &str = "vkcp.proxy.denied";
 pub async fn start_proxy(
     addr: impl ToSocketAddrs,
     actions: Sender<state_machine::Message>,
+    tags: Vec<(String, String)>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await.context("starting listener")?;
     while let Ok((ingress, _)) = listener.accept().await {
-        counter!(METRIC_PROXY_REQUESTS).increment(1);
-        tokio::spawn(proxy_connection(ingress, actions.clone()));
+        counter!(METRIC_PROXY_REQUESTS, &tags).increment(1);
+        tokio::spawn(proxy_connection(ingress, actions.clone(), tags.clone()));
     }
 
     Ok(())
 }
 
-async fn proxy_connection(mut ingress: TcpStream, actions: Sender<state_machine::Message>) {
+async fn proxy_connection(
+    mut ingress: TcpStream,
+    actions: Sender<state_machine::Message>,
+    tags: Vec<(String, String)>,
+) {
     let (tx, rx) = oneshot::channel();
     if let Err(e) = actions
         .send(state_machine::Message::GetCurrentMaster(tx))
@@ -41,12 +46,12 @@ async fn proxy_connection(mut ingress: TcpStream, actions: Sender<state_machine:
             let mut egress = match TcpStream::connect(addr).await {
                 Ok(e) => e,
                 Err(e) => {
-                    counter!(METRIC_PROXY_ERRORS).increment(1);
+                    counter!(METRIC_PROXY_ERRORS, &tags).increment(1);
                     error!(error = format!("{e:#}"), "connecting to valkey");
                     return;
                 }
             };
-            gauge!(METRIC_PROXY_CONNECTIONS).increment(1);
+            gauge!(METRIC_PROXY_CONNECTIONS, &tags).increment(1);
             select! {
                 _ = context.cancelled() => {
                     // master was demoted and/or became unhealthy
@@ -59,16 +64,16 @@ async fn proxy_connection(mut ingress: TcpStream, actions: Sender<state_machine:
                             debug!("proxied {to_egress} bytes from client and {to_ingress} bytes from server");
                         }
                         Err(e) => {
-                            counter!(METRIC_PROXY_ERRORS).increment(1);
+                            counter!(METRIC_PROXY_ERRORS, &tags).increment(1);
                             warn!("error proxying: {e}");
                         }
                     }
                 }
             }
-            gauge!(METRIC_PROXY_CONNECTIONS).decrement(1);
+            gauge!(METRIC_PROXY_CONNECTIONS, &tags).decrement(1);
         }
         Ok(None) => {
-            counter!(METRIC_PROXY_DENIED).increment(1);
+            counter!(METRIC_PROXY_DENIED, &tags).increment(1);
             debug!("proxying is disabled");
             return;
         }

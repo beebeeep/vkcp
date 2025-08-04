@@ -31,11 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ctrl, actions) = controller::Server::new(&cfg).context("starting controller")?;
 
     let mut tasks = Vec::new();
+    let tags: Vec<(String, String)> = cfg.extra_tags.map_or(vec![], |v| v.into_iter().collect());
 
     // starting valkey proxy
     tasks.push(tokio::spawn(vkcp::proxy::start_proxy(
         cfg.proxy_bind_addr,
         actions,
+        tags.clone(),
     )));
 
     // starting controller

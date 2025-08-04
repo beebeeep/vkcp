@@ -3,6 +3,9 @@ ctrl_bind_addr = "127.0.0.1:50053"
 proxy_bind_addr = "127.0.0.1:8083"
 servers = [ "vk1:6379", "vk2:6379", "vk3:6379" ]
 
+[extra_tags]
+instance = "local"
+
 [[peers]]
   addr = "http://127.0.0.1:50051"
   id = 0

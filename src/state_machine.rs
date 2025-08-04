@@ -89,6 +89,7 @@ pub struct StateMachine {
     election_timeout_range: Range<u64>,
     vk_server_timeout: Duration,
     vk_server_check_period: Duration,
+    tags: Vec<(String, String)>,
 
     // valkey servers status
     servers: Vec<ServerState>,
@@ -161,15 +162,20 @@ impl StateMachine {
             term: 0,
             voted_for: None,
             updates_pending: 0,
+            tags: cfg
+                .extra_tags
+                .clone()
+                .map_or(vec![], |tags| tags.into_iter().collect()),
         };
         r.set_election_timeout();
+        r.tags.push((String::from("peer_id"), format!("{}", r.id)));
         Ok(r)
     }
 
     pub async fn run(&mut self) {
         loop {
-            gauge!(METRIC_NODE_STATE).set(self.state as i32);
-            gauge!(METRIC_NODE_TERM).set(self.term as f64);
+            gauge!(METRIC_NODE_STATE, &self.tags).set(self.state as i32);
+            gauge!(METRIC_NODE_TERM, &self.tags).set(self.term as f64);
             let err = match self.state {
                 MachineState::Leader => self.run_leader().await,
                 MachineState::Follower => self.run_follower().await,
@@ -325,7 +331,7 @@ impl StateMachine {
                 leader = req.leader_id,
                 "heartbeat from stale leader"
             );
-            counter!(METRIC_HEARTBEAT_FAIL).increment(1);
+            counter!(METRIC_HEARTBEAT_FAIL, &self.tags).increment(1);
             return Ok(grpc::HeartbeatResponse {
                 term: self.term,
                 success: false,
@@ -336,7 +342,7 @@ impl StateMachine {
         }
         self.set_election_timeout();
         self.update_servers(req.servers);
-        counter!(METRIC_HEARTBEAT_OK).increment(1);
+        counter!(METRIC_HEARTBEAT_OK, &self.tags).increment(1);
 
         Ok(grpc::HeartbeatResponse {
             term: self.term,
@@ -481,8 +487,8 @@ impl StateMachine {
             }
             debug!(state = ?server, "server state");
         }
-        gauge!(METRIC_SERVER_HEALTHY).set(healthy);
-        gauge!(METRIC_SERVER_MASTERS).set(masters);
+        gauge!(METRIC_SERVER_HEALTHY, &self.tags).set(healthy);
+        gauge!(METRIC_SERVER_MASTERS, &self.tags).set(masters);
 
         self.update_replication_topology()
             .await
@@ -603,6 +609,7 @@ impl StateMachine {
                 servers: self.servers.iter().map(|x| x.inner.clone()).collect(),
             };
             let msgs = self.tx_msgs.clone();
+            let tags = self.tags.clone();
             task::spawn(async move {
                 select! {
                     _ = time::sleep_until(update_timeout) => {
@@ -611,13 +618,13 @@ impl StateMachine {
                     resp = client.heartbeat(req) => {
                         match resp {
                             Ok(resp) => {
-                                counter!(METRIC_HEARTBEATS_SENT_OK).increment(1);
+                                counter!(METRIC_HEARTBEATS_SENT_OK, &tags).increment(1);
                                 let resp = resp.into_inner();
                                 debug!(follower = peer_id, success = resp.success, "follower Heartbeat response");
                                 let _ = msgs.send(Message::HeartbeatResponse(resp)).await;
                             }
                             Err(err) => {
-                                counter!(METRIC_HEARTBEATS_SENT_ERR).increment(1);
+                                counter!(METRIC_HEARTBEATS_SENT_ERR, &tags).increment(1);
                                 error!(peer_id = peer_id, error = format!("{err:#}"), "sending Heartbeat");
                             }
                         }
