@@ -475,19 +475,20 @@ impl StateMachine {
                 }
                 Ok(_) => {}
             }
-            if server.inner.healthy {
-                gauge!(
-                    METRIC_SERVER_HEALTHY,
-                    "role" => if server.inner.is_master {
-                        "master"
-                    } else {
-                        "replica"
-                    }
-                )
-                .set(1);
-            } else {
-                gauge!(METRIC_SERVER_HEALTHY, "role" => "unknown").set(0);
-            }
+
+            let mut tags = self.tags.clone();
+            tags.push((String::from("server"), server.inner.addr.clone()));
+            tags.push((
+                String::from("role"),
+                String::from(if server.inner.is_master {
+                    "master"
+                } else if server.inner.healthy {
+                    "replica"
+                } else {
+                    "unknown"
+                }),
+            ));
+            gauge!(METRIC_SERVER_HEALTHY, &tags).set(if server.inner.healthy { 1 } else { 0 });
             debug!(state = ?server, "server state");
         }
 
@@ -686,8 +687,9 @@ impl ServerState {
         cfg.fail_fast = true;
         let mut builder = fredis::Builder::from_config(cfg);
         builder.with_connection_config(|cfg| {
+            cfg.internal_command_timeout = timeout;
             cfg.connection_timeout = timeout;
-            cfg.connection_timeout = timeout;
+            cfg.max_command_attempts = 1;
             cfg.tcp = fredis::TcpConfig {
                 nodelay: Some(true),
                 ..Default::default()
@@ -776,7 +778,6 @@ impl ServerState {
 
     async fn promote(&mut self, timeout: Duration) -> Result<()> {
         let client = self.connect(timeout).await?;
-        info!(server = self.inner.addr, "promoting server");
         let _: () = client
             .custom(fred::cmd!("REPLICAOF"), vec!["NO", "ONE"])
             .await
