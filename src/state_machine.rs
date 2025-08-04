@@ -36,6 +36,7 @@ const METRIC_NODE_TERM: &str = "vkcp.election.term";
 const METRIC_HEARTBEATS_SENT_OK: &str = "vkcp.election.leader.heartbeat.sent";
 const METRIC_HEARTBEATS_SENT_ERR: &str = "vkcp.election.leader.heartbeat.error";
 const METRIC_SERVER_HEALTHY: &str = "vkcp.server.healthcheck.healthy";
+const METRIC_SERVER_HAS_MASTER: &str = "vkcp.server.healthcheck.has_master";
 
 #[derive(Copy, Clone)]
 pub enum MachineState {
@@ -478,16 +479,6 @@ impl StateMachine {
 
             let mut tags = self.tags.clone();
             tags.push((String::from("server"), server.inner.addr.clone()));
-            tags.push((
-                String::from("role"),
-                String::from(if server.inner.is_master {
-                    "master"
-                } else if server.inner.healthy {
-                    "replica"
-                } else {
-                    "unknown"
-                }),
-            ));
             gauge!(METRIC_SERVER_HEALTHY, &tags).set(if server.inner.healthy { 1 } else { 0 });
             debug!(state = ?server, "server state");
         }
@@ -528,6 +519,17 @@ impl StateMachine {
 
     async fn update_replication_topology(&mut self) -> Result<()> {
         self.select_preferred_master();
+
+        let mut tags = self.tags.clone();
+        tags.push((
+            String::from("master"),
+            self.preferred_master
+                .as_ref()
+                .map_or(String::from("n/a"), |s| s.clone()),
+        ));
+        gauge!(METRIC_SERVER_HAS_MASTER, &tags)
+            .set(self.preferred_master.as_ref().map_or(0, |_| 1));
+
         if self.preferred_master.is_none() {
             warn!("cannot find a suitable new master, all nodes are unhealthy");
             return Ok(());
@@ -672,11 +674,17 @@ impl StateMachine {
                     // server became unhealthy, terminate all connections
                     old.cancel();
                 }
-                if !old.inner.is_master && new.is_master && new.healthy {
-                    // server was promoted and is healthy, setup context for clients
-                    old.context = Some(CancellationToken::new());
+                if old.inner.is_master && !new.is_master {
+                    // server was demoted, terminate all connections
+                    old.cancel()
                 }
                 old.inner = new;
+            }
+        }
+
+        for s in self.servers.iter_mut() {
+            if s.inner.is_master && s.inner.healthy && s.context.is_none() {
+                s.context = Some(CancellationToken::new())
             }
         }
     }
