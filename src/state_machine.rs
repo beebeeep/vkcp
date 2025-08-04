@@ -611,7 +611,8 @@ impl StateMachine {
                 servers: self.servers.iter().map(|x| x.inner.clone()).collect(),
             };
             let msgs = self.tx_msgs.clone();
-            let tags = self.tags.clone();
+            let mut tags = self.tags.clone();
+            tags.push((String::from("follower_id"), format!("{}", peer_id)));
             task::spawn(async move {
                 select! {
                     _ = time::sleep_until(update_timeout) => {
