@@ -35,8 +35,7 @@ const METRIC_NODE_STATE: &str = "vkcp.election.state";
 const METRIC_NODE_TERM: &str = "vkcp.election.term";
 const METRIC_HEARTBEATS_SENT_OK: &str = "vkcp.election.leader.heartbeat.sent";
 const METRIC_HEARTBEATS_SENT_ERR: &str = "vkcp.election.leader.heartbeat.error";
-const METRIC_SERVER_HEALTHY: &str = "vkcp.server.healthcheck.healthy";
-const METRIC_SERVER_HAS_MASTER: &str = "vkcp.server.healthcheck.has_master";
+const METRIC_SERVER_STATE: &str = "vkcp.server.healthcheck.state";
 
 #[derive(Copy, Clone)]
 pub enum MachineState {
@@ -479,7 +478,13 @@ impl StateMachine {
 
             let mut tags = self.tags.clone();
             tags.push((String::from("server"), server.inner.addr.clone()));
-            gauge!(METRIC_SERVER_HEALTHY, &tags).set(if server.inner.healthy { 1 } else { 0 });
+            gauge!(METRIC_SERVER_STATE, &tags).set(
+                match (server.inner.healthy, server.inner.is_master) {
+                    (false, _) => 0,    // unhealthy
+                    (true, true) => 1,  // master
+                    (true, false) => 2, // replica
+                },
+            );
             debug!(state = ?server, "server state");
         }
 
@@ -519,17 +524,6 @@ impl StateMachine {
 
     async fn update_replication_topology(&mut self) -> Result<()> {
         self.select_preferred_master();
-
-        let mut tags = self.tags.clone();
-        tags.push((
-            String::from("master"),
-            self.preferred_master
-                .as_ref()
-                .map_or(String::from("n/a"), |s| s.clone()),
-        ));
-        gauge!(METRIC_SERVER_HAS_MASTER, &tags)
-            .set(self.preferred_master.as_ref().map_or(0, |_| 1));
-
         if self.preferred_master.is_none() {
             warn!("cannot find a suitable new master, all nodes are unhealthy");
             return Ok(());
