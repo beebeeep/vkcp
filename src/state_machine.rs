@@ -36,7 +36,6 @@ const METRIC_NODE_TERM: &str = "vkcp.election.term";
 const METRIC_HEARTBEATS_SENT_OK: &str = "vkcp.election.leader.heartbeat.sent";
 const METRIC_HEARTBEATS_SENT_ERR: &str = "vkcp.election.leader.heartbeat.error";
 const METRIC_SERVER_HEALTHY: &str = "vkcp.server.healthcheck.healthy";
-const METRIC_SERVER_MASTERS: &str = "vkcp.server.healthcheck.masters";
 
 #[derive(Copy, Clone)]
 pub enum MachineState {
@@ -277,9 +276,9 @@ impl StateMachine {
                         // do not care as candidate
                     },
                     Message::Heartbeat{req, resp } => {
-                        if req.term > self.term {
+                        if req.term >= self.term {
                             // leader was elected and already send Heartbeat
-                            debug!(term = req.term, "got AppendEntries with greater term");
+                            debug!(term = req.term, "got AppendEntries from new leader");
                             self.convert_to_follower(req.term);
                         }
                         let _ = resp.send(self.heartbeat(req).await.context("processing Heartbeat"));
@@ -467,7 +466,6 @@ impl StateMachine {
         }
         self.next_servers_ping = Instant::now() + self.vk_server_check_period;
 
-        let (mut masters, mut healthy) = (0, 0);
         for server in self.servers.iter_mut() {
             match server.update_state(self.vk_server_timeout).await {
                 Err(e) => {
@@ -480,15 +478,20 @@ impl StateMachine {
                 Ok(_) => {}
             }
             if server.inner.healthy {
-                healthy += 1;
-            }
-            if server.inner.is_master {
-                masters += 1;
+                gauge!(
+                    METRIC_SERVER_HEALTHY,
+                    "role" => if server.inner.is_master {
+                        "master"
+                    } else {
+                        "replica"
+                    }
+                )
+                .set(1);
+            } else {
+                gauge!(METRIC_SERVER_HEALTHY, "role" => "unknown").set(0);
             }
             debug!(state = ?server, "server state");
         }
-        gauge!(METRIC_SERVER_HEALTHY, &self.tags).set(healthy);
-        gauge!(METRIC_SERVER_MASTERS, &self.tags).set(masters);
 
         self.update_replication_topology()
             .await
