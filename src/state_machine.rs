@@ -28,6 +28,7 @@ const DEFAULT_ELECTION_TIMEOUT_MS_MIN: u64 = 4000;
 const DEFAULT_ELECTION_TIMEOUT_MS_MAX: u64 = 6000;
 const DEFAULT_VK_SERVER_TIMEOUT: u64 = 500;
 const DEFAULT_VK_SERVER_CHECK_PERIOD: u64 = 2000;
+const PEER_KEEPALIVE: Duration = Duration::from_secs(5);
 
 const METRIC_HEARTBEAT_FAIL: &str = "vkcp.election.follower.heartbeat.fails";
 const METRIC_HEARTBEAT_OK: &str = "vkcp.election.follower.heartbeat.oks";
@@ -476,15 +477,7 @@ impl StateMachine {
                 Ok(_) => {}
             }
 
-            let mut tags = self.tags.clone();
-            tags.push((String::from("server"), server.inner.addr.clone()));
-            gauge!(METRIC_SERVER_STATE, &tags).set(
-                match (server.inner.healthy, server.inner.is_master) {
-                    (false, _) => 0,    // unhealthy
-                    (true, true) => 1,  // master
-                    (true, false) => 2, // replica
-                },
-            );
+            server.emit_state_metrics(&self.tags);
             debug!(state = ?server, "server state");
         }
 
@@ -637,10 +630,11 @@ impl StateMachine {
     fn init_peers(peer_configs: Vec<config::PeerConfig>) -> Result<Vec<PeerState>> {
         let mut peers = Vec::with_capacity(peer_configs.len());
         for peer in peer_configs.into_iter() {
-            println!("connected to {}", peer.addr);
+            // TODO: maybe replace with connector that deals with DNS re-resolving?
+            let ch = Channel::from_shared(peer.addr)?.tcp_keepalive(Some(PEER_KEEPALIVE));
             peers.push(PeerState {
                 id: peer.id,
-                client: VkcpClient::new(Channel::from_shared(peer.addr)?.connect_lazy()),
+                client: VkcpClient::new(ch.connect_lazy()),
             })
         }
         Ok(peers)
@@ -677,6 +671,7 @@ impl StateMachine {
         }
 
         for s in self.servers.iter_mut() {
+            s.emit_state_metrics(&self.tags);
             if s.inner.is_master && s.inner.healthy && s.context.is_none() {
                 s.context = Some(CancellationToken::new())
             }
@@ -788,6 +783,16 @@ impl ServerState {
 
         // self.inner.is_master = true; // not really needed?
         Ok(())
+    }
+
+    fn emit_state_metrics(&self, tags: &Vec<(String, String)>) {
+        let mut tags = tags.clone();
+        tags.push((String::from("server"), self.inner.addr.clone()));
+        gauge!(METRIC_SERVER_STATE, &tags).set(match (self.inner.healthy, self.inner.is_master) {
+            (false, _) => 0,    // unhealthy
+            (true, true) => 1,  // master
+            (true, false) => 2, // replica
+        });
     }
 
     async fn replicate_from(&mut self, addr: &str, timeout: Duration) -> Result<()> {
