@@ -75,11 +75,9 @@ async fn proxy_connection(
         Ok(None) => {
             counter!(METRIC_PROXY_DENIED, &tags).increment(1);
             debug!("proxying is disabled");
-            return;
         }
         Err(e) => {
             warn!(error = format!("{e:#}"), "getting current master");
-            return;
         }
     }
 }

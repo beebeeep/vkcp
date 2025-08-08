@@ -25,7 +25,7 @@ impl Server {
     pub fn new(cfg: &config::Config) -> Result<(Self, mpsc::Sender<state_machine::Message>)> {
         let (tx, rx) = mpsc::channel(8);
 
-        let mut sm = state_machine::StateMachine::new(&cfg, rx, tx.clone())
+        let mut sm = state_machine::StateMachine::new(cfg, rx, tx.clone())
             .context("initializing state machine")?;
         tokio::spawn(async move { sm.run().await });
 

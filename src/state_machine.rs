@@ -466,15 +466,12 @@ impl StateMachine {
         self.next_servers_ping = Instant::now() + self.vk_server_check_period;
 
         for server in self.servers.iter_mut() {
-            match server.update_state(self.vk_server_timeout).await {
-                Err(e) => {
-                    error!(
-                        server = &server.inner.addr,
-                        error = format!("{e:#}"),
-                        "getting server info"
-                    );
-                }
-                Ok(_) => {}
+            if let Err(e) = server.update_state(self.vk_server_timeout).await {
+                error!(
+                    server = &server.inner.addr,
+                    error = format!("{e:#}"),
+                    "getting server info"
+                );
             }
 
             server.emit_state_metrics(&self.tags);
@@ -494,8 +491,7 @@ impl StateMachine {
             if self
                 .servers
                 .iter()
-                .find(|s| &s.inner.addr == m && s.inner.healthy && s.inner.is_master)
-                .is_some()
+                .any(|s| &s.inner.addr == m && s.inner.healthy && s.inner.is_master)
             {
                 // ... it is healthy and actually master
                 return;
@@ -539,29 +535,23 @@ impl StateMachine {
                         info!(server = server.inner.addr, "promoting master");
                     }
                 }
-            } else {
-                if server
-                    .replicaof
-                    .as_ref()
-                    .map_or(true, |s| s != preferred_master)
+            } else if server.replicaof.as_ref() != Some(preferred_master) {
+                if let Err(e) = server
+                    .replicate_from(preferred_master, self.vk_server_timeout)
+                    .await
                 {
-                    if let Err(e) = server
-                        .replicate_from(preferred_master, self.vk_server_timeout)
-                        .await
-                    {
-                        warn!(
-                            server = server.inner.addr,
-                            new_master = preferred_master,
-                            error = format!("{e:#}"),
-                            "failed to set replication"
-                        );
-                    } else {
-                        info!(
-                            server = server.inner.addr,
-                            new_master = preferred_master,
-                            "setting replication"
-                        );
-                    }
+                    warn!(
+                        server = server.inner.addr,
+                        new_master = preferred_master,
+                        error = format!("{e:#}"),
+                        "failed to set replication"
+                    );
+                } else {
+                    info!(
+                        server = server.inner.addr,
+                        new_master = preferred_master,
+                        "setting replication"
+                    );
                 }
             }
         }
@@ -630,7 +620,6 @@ impl StateMachine {
     fn init_peers(peer_configs: Vec<config::PeerConfig>) -> Result<Vec<PeerState>> {
         let mut peers = Vec::with_capacity(peer_configs.len());
         for peer in peer_configs.into_iter() {
-            // TODO: maybe replace with connector that deals with DNS re-resolving?
             let ch = Channel::from_shared(peer.addr)?.tcp_keepalive(Some(PEER_KEEPALIVE));
             peers.push(PeerState {
                 id: peer.id,
@@ -785,8 +774,8 @@ impl ServerState {
         Ok(())
     }
 
-    fn emit_state_metrics(&self, tags: &Vec<(String, String)>) {
-        let mut tags = tags.clone();
+    fn emit_state_metrics(&self, tags: &[(String, String)]) {
+        let mut tags = tags.to_owned();
         tags.push((String::from("server"), self.inner.addr.clone()));
         gauge!(METRIC_SERVER_STATE, &tags).set(match (self.inner.healthy, self.inner.is_master) {
             (false, _) => 0,    // unhealthy
@@ -814,7 +803,7 @@ impl ServerState {
         }
     }
 
-    fn get_host_port<'a>(addr: &'a str) -> (&'a str, u16) {
+    fn get_host_port(addr: &str) -> (&str, u16) {
         let mut p = addr.split(":");
         match (p.next(), p.next()) {
             (Some(h), Some(p)) => (h, p.parse().unwrap_or_default()),
